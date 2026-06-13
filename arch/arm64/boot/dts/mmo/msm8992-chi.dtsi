@@ -29,6 +29,7 @@
 #include "common/reserved-memory.dtsi"
 #include "common/nfc.dtsi"
 #include "common/gpios.dtsi"
+#include "common/torch.dtsi"
 
 / {
 	aliases {
