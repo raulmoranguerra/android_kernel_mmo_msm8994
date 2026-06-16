@@ -410,7 +410,7 @@ CONFIG_SECCOMP=y
 #
 # Boot options
 #
-CONFIG_CMDLINE="earlyprintk=msm_hsl_uart console=ttyHSL0,115200"
+CONFIG_CMDLINE=""
 CONFIG_CMDLINE_FROM_BOOTLOADER=y
 # CONFIG_CMDLINE_EXTEND is not set
 # CONFIG_CMDLINE_FORCE is not set
@@ -3799,7 +3799,7 @@ CONFIG_MISC_FILESYSTEMS=y
 # CONFIG_ADFS_FS is not set
 # CONFIG_AFFS_FS is not set
 # CONFIG_ECRYPT_FS is not set
-# CONFIG_SDCARD_FS is not set
+CONFIG_SDCARD_FS=y
 # CONFIG_HFS_FS is not set
 # CONFIG_HFSPLUS_FS is not set
 # CONFIG_BEFS_FS is not set
