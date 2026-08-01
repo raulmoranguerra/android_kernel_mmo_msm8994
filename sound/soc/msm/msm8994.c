@@ -35,6 +35,9 @@
 #include "qdsp6v2/msm-pcm-routing-v2.h"
 #include "../codecs/wcd9xxx-common.h"
 #include "../codecs/wcd9330.h"
+#ifdef CONFIG_SND_SOC_TAS2552
+#include "../codecs/tas2552.h"
+#endif
 
 #define DRV_NAME "msm8994-asoc-snd"
 
@@ -90,6 +93,9 @@ struct msm8994_asoc_mach_data {
 	struct msm_pinctrl_info pinctrl_info;
 	void __iomem *pri_mux;
 	void __iomem *sec_mux;
+#ifdef CONFIG_SND_SOC_TAS2552
+	void __iomem *quat_mux;
+#endif
 };
 
 static int slim0_rx_sample_rate = SAMPLING_RATE_48KHZ;
@@ -1336,6 +1342,12 @@ static void msm_release_pinctrl(struct platform_device *pdev)
 	if (pinctrl_info) {
 		iounmap(pdata->pri_mux);
 		iounmap(pdata->sec_mux);
+#ifdef CONFIG_SND_SOC_TAS2552
+		if (pdata->quat_mux) {
+			iounmap(pdata->quat_mux);
+			pdata->quat_mux = NULL;
+		}
+#endif
 		devm_pinctrl_put(pinctrl_info->pinctrl);
 		pinctrl_info->pinctrl = NULL;
 	}
@@ -1585,6 +1597,133 @@ static struct snd_soc_ops msm8994_mi2s_be_ops = {
 	.startup = msm8994_mi2s_snd_startup,
 	.shutdown = msm8994_mi2s_snd_shutdown,
 };
+
+#ifdef CONFIG_SND_SOC_TAS2552
+/*
+ * Quaternary MI2S RX drives the TAS2553 loudspeaker amplifier. The pins are
+ * muxed statically by the amplifier's own "default" pinctrl state (see
+ * mmo/common/audio.dtsi), so all that is left to do here is put the LPAIF
+ * port into I2S mode, run the bit clock and tell the amplifier to lock its
+ * PLL to it. There is no MCLK routed to the amplifier on this board.
+ */
+static struct afe_clk_cfg quat_mi2s_clk = {
+	AFE_API_VERSION_I2S_CONFIG,
+	Q6AFE_LPASS_IBIT_CLK_1_P536_MHZ,
+	Q6AFE_LPASS_OSR_CLK_DISABLE,
+	Q6AFE_LPASS_CLK_SRC_INTERNAL,
+	Q6AFE_LPASS_CLK_ROOT_DEFAULT,
+	Q6AFE_LPASS_MODE_CLK1_VALID,
+	0,
+};
+
+static atomic_t quat_mi2s_rsc_ref;
+
+static int msm8994_quat_mi2s_snd_startup(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_card *card = rtd->card;
+	struct snd_soc_dai *codec_dai = rtd->codec_dai;
+	struct msm8994_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
+	int ret;
+
+	pr_debug("%s: substream = %s  stream = %d\n", __func__,
+		substream->name, substream->stream);
+
+	if (atomic_inc_return(&quat_mi2s_rsc_ref) != 1)
+		return 0;
+
+	if (pdata->quat_mux == NULL) {
+		pr_err("%s: QUAT MI2S muxsel addr is NULL\n", __func__);
+		ret = -EINVAL;
+		goto err;
+	}
+	iowrite32(I2S_PCM_SEL_I2S << I2S_PCM_SEL_OFFSET, pdata->quat_mux);
+
+	quat_mi2s_clk.clk_val1 = Q6AFE_LPASS_IBIT_CLK_1_P536_MHZ;
+	quat_mi2s_clk.clk_val2 = Q6AFE_LPASS_OSR_CLK_DISABLE;
+	quat_mi2s_clk.clk_set_mode = Q6AFE_LPASS_MODE_CLK1_VALID;
+	ret = afe_set_lpass_clock(AFE_PORT_ID_QUATERNARY_MI2S_RX,
+				  &quat_mi2s_clk);
+	if (ret < 0) {
+		pr_err("%s: afe lpass clock failed, err:%d\n", __func__, ret);
+		goto err;
+	}
+
+	ret = snd_soc_dai_set_sysclk(codec_dai, TAS2552_SCLK_S_BCLK,
+				     quat_mi2s_clk.clk_val1, SND_SOC_CLOCK_IN);
+	if (ret < 0) {
+		pr_err("%s: set sysclk on codec dai failed, err:%d\n",
+			__func__, ret);
+		goto err;
+	}
+
+	return 0;
+err:
+	atomic_dec(&quat_mi2s_rsc_ref);
+	return ret;
+}
+
+static void msm8994_quat_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
+{
+	int ret;
+
+	pr_debug("%s: substream = %s  stream = %d\n", __func__,
+		substream->name, substream->stream);
+
+	if (atomic_dec_return(&quat_mi2s_rsc_ref) != 0)
+		return;
+
+	quat_mi2s_clk.clk_val1 = Q6AFE_LPASS_IBIT_CLK_DISABLE;
+	quat_mi2s_clk.clk_val2 = Q6AFE_LPASS_OSR_CLK_DISABLE;
+	quat_mi2s_clk.clk_set_mode = Q6AFE_LPASS_MODE_BOTH_VALID;
+	ret = afe_set_lpass_clock(AFE_PORT_ID_QUATERNARY_MI2S_RX,
+				  &quat_mi2s_clk);
+	if (ret < 0)
+		pr_err("%s: afe lpass clock failed, err:%d\n", __func__, ret);
+}
+
+static struct snd_soc_ops msm8994_quat_mi2s_be_ops = {
+	.startup = msm8994_quat_mi2s_snd_startup,
+	.shutdown = msm8994_quat_mi2s_snd_shutdown,
+};
+
+static int msm_be_quat_mi2s_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+					    struct snd_pcm_hw_params *params)
+{
+	struct snd_interval *rate = hw_param_interval(params,
+					SNDRV_PCM_HW_PARAM_RATE);
+	struct snd_interval *channels = hw_param_interval(params,
+					SNDRV_PCM_HW_PARAM_CHANNELS);
+
+	param_set_mask(params, SNDRV_PCM_HW_PARAM_FORMAT,
+			SNDRV_PCM_FORMAT_S16_LE);
+	rate->min = rate->max = SAMPLING_RATE_48KHZ;
+	channels->min = channels->max = 2;
+	return 0;
+}
+
+static int msm_quat_mi2s_get_muxsel(struct platform_device *pdev)
+{
+	struct snd_soc_card *card = platform_get_drvdata(pdev);
+	struct msm8994_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
+	struct resource *muxsel;
+
+	muxsel = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+					"lpaif_quat_mode_muxsel");
+	if (!muxsel) {
+		dev_err(&pdev->dev, "MUX addr invalid for QUAT MI2S\n");
+		return -ENODEV;
+	}
+
+	pdata->quat_mux = ioremap(muxsel->start, resource_size(muxsel));
+	if (pdata->quat_mux == NULL) {
+		dev_err(&pdev->dev, "QUAT MI2S muxsel ioremap failed\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+#endif /* CONFIG_SND_SOC_TAS2552 */
 
 static int msm_slim_0_rx_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 					    struct snd_pcm_hw_params *params)
@@ -3207,7 +3346,25 @@ static struct snd_soc_dai_link msm8994_common_dai_links[] = {
 		.be_hw_params_fixup = msm_tx_be_hw_params_fixup,
 		.ops = &msm8994_mi2s_be_ops,
 		.ignore_suspend = 1,
+	},
+#ifdef CONFIG_SND_SOC_TAS2552
+	{
+		.name = LPASS_BE_QUAT_MI2S_RX,
+		.stream_name = "Quaternary MI2S Playback",
+		.cpu_dai_name = "msm-dai-q6-mi2s.3",
+		.platform_name = "msm-pcm-routing",
+		/* i2c bus 2, address 0x40 */
+		.codec_name = "tas2552.2-0040",
+		.codec_dai_name = "tas2552-dai",
+		.no_pcm = 1,
+		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBS_CFS |
+			SND_SOC_DAIFMT_NB_NF,
+		.be_id = MSM_BACKEND_DAI_QUATERNARY_MI2S_RX,
+		.be_hw_params_fixup = msm_be_quat_mi2s_hw_params_fixup,
+		.ops = &msm8994_quat_mi2s_be_ops,
+		.ignore_suspend = 1,
 	}
+#endif
 };
 
 static struct snd_soc_dai_link msm8994_hdmi_dai_link[] = {
@@ -3525,6 +3682,18 @@ static int msm8994_asoc_machine_probe(struct platform_device *pdev)
 			__func__, ret);
 		goto err;
 	}
+
+#ifdef CONFIG_SND_SOC_TAS2552
+	atomic_set(&quat_mi2s_rsc_ref, 0);
+	ret = msm_quat_mi2s_get_muxsel(pdev);
+	if (ret) {
+		dev_info(&pdev->dev,
+			"%s: QUAT MI2S muxsel unavailable (%d), speaker disabled\n",
+			__func__, ret);
+		ret = 0;
+	}
+#endif
+
 	ret = apq8094_db_device_init();
 	if (ret) {
 		pr_err("%s: DB8094 init ext devices stat IRQ failed (%d)\n",
