@@ -323,6 +323,15 @@ config SND_SOC_STA529
 config SND_SOC_STAC9766
 	tristate
 
+config SND_SOC_TAS2552
+	tristate "Texas Instruments TAS2552 smart amplifier"
+	depends on I2C
+	help
+	  Enable support for the TI TAS2552 mono Class-D amplifier with
+	  integrated boost converter, controlled over I2C and fed from an
+	  I2S port. Also covers the register compatible TAS2553 fitted to
+	  the Microsoft Lumia 950 and 950 XL.
+
 config SND_SOC_TAS5086
 	tristate
 
