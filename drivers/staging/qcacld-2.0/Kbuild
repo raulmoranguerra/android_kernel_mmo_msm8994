@@ -967,6 +967,9 @@ EXTRA_CFLAGS += $(INCS)
 
 EXTRA_CFLAGS += -Wno-unused-function -Wno-unused-variable
 
+# -Werror was dropped from CDEFINES below: this vendor drop predates GCC 5 and
+# trips a dozen warnings that later compilers promote by default. The warnings
+# are still reported, they just no longer stop the build.
 CDEFINES :=	-DANI_LITTLE_BYTE_ENDIAN \
 		-DANI_LITTLE_BIT_ENDIAN \
 		-DQC_WLAN_CHIPSET_QCA_CLD \
@@ -977,7 +980,6 @@ CDEFINES :=	-DANI_LITTLE_BYTE_ENDIAN \
 		-DWLAN_PERF \
 		-DPTT_SOCK_SVC_ENABLE \
 		-Wall\
-		-Werror\
 		-D__linux__ \
 		-DHAL_SELF_STA_PER_BSS=1 \
 		-DWLAN_FEATURE_VOWIFI_11R \
