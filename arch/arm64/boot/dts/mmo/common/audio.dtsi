@@ -47,9 +47,56 @@
 		qcom,us-euro-gpios = <&pm8994_mpps 2 0>;
 		qcom,cdc-micbias2-headset-only;
 		qcom,mbhc-audio-jack-type = "4-pole-jack";
+		qcom,mbhc-insert-detect-inverted;
 		qcom,ext-ult-spk-amp-gpio = <&pmi8994_gpios 1 0>;
 		asoc-codec = <&stub_codec>;
 		asoc-codec-names = "msm-stub-codec.1";
+	};
+};
+
+/*
+ * The main loudspeaker hangs off a TI TAS2553 (register compatible with the
+ * TAS2552) rather than the WCD9330's own speaker driver. It is controlled
+ * over BLSP1 I2C-2 and fed audio over Quaternary MI2S.
+ *
+ * The MI2S pins are claimed here as the amplifier's "default" pinctrl state
+ * instead of being switched by the sound card: the ASoC machine driver
+ * already owns a pinctrl handle for the sound node, and pinctrl_get() hands
+ * back that same handle, so a second consumer selecting states on it would
+ * silently tear down the primary MI2S and AuxPCM pin configuration. Nothing
+ * else on the board can use GPIO 58/59/62, so a static mux is correct.
+ */
+&i2c_2 {
+	status = "ok";
+
+	tas2552: tas2552@40 {
+		compatible = "ti,tas2552";
+		reg = <0x40>;
+
+		ti,enable-gpio = <&pm8994_gpios 12 0>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&quat_mi2s_active>, <&quat_mi2s_sd2_active>;
+	};
+};
+
+/*
+ * Amplifier enable. The schematic labels TLMM GPIO 144 as the speaker enable,
+ * but on production hardware the line that actually gates the TAS2553 is
+ * PM8994 GPIO 12 -- with it low the chip does not acknowledge on I2C at all.
+ */
+&pm8994_gpios {
+	gpio@cb00 {
+		status = "ok";
+		qcom,pin-num = <12>;
+		qcom,mode = <1>;		/* digital output */
+		qcom,output-type = <0>;		/* CMOS */
+		qcom,invert = <0>;		/* start low, amp off */
+		qcom,pull = <5>;		/* no pull */
+		qcom,vin-sel = <2>;		/* 1.8 V */
+		qcom,src-sel = <0>;		/* constant */
+		qcom,out-strength = <1>;	/* low */
+		qcom,master-en = <1>;
 	};
 };
 

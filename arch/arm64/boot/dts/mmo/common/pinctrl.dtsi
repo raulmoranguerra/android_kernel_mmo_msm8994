@@ -70,5 +70,35 @@
 				bias-disable;
 			};
 		};
+
+		/*
+		 * Quaternary MI2S feeds the TAS2553 loudspeaker amplifier.
+		 * Only SCK, WS and SD2 are wired to it: SD0/SD1 (60/61) belong
+		 * to the touchscreen, and muxing SD3 (63) trips an XPU
+		 * violation that hard-resets the device.
+		 */
+		pmx_quat_mi2s {
+			qcom,pins = <&gp 58>, <&gp 59>; /* SCK, WS */
+			qcom,num-grp-pins = <2>;
+			qcom,pin-func = <1>;
+			label = "quat_mi2s";
+
+			quat_mi2s_active: quat_mi2s_active {
+				drive-strength = <8>;
+				bias-disable;
+			};
+		};
+
+		pmx_quat_mi2s_sd2 {
+			qcom,pins = <&gp 62>; /* SD2, amplifier data in */
+			qcom,num-grp-pins = <1>;
+			qcom,pin-func = <1>;
+			label = "quat_mi2s_sd2";
+
+			quat_mi2s_sd2_active: quat_mi2s_sd2_active {
+				drive-strength = <8>;
+				bias-disable;
+			};
+		};
 	};
 };
