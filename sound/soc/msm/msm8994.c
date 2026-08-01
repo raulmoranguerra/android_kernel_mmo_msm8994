@@ -3651,6 +3651,19 @@ static int msm8994_asoc_machine_probe(struct platform_device *pdev)
 			dev_dbg(&pdev->dev, "Unknown value, set to default");
 		}
 	}
+	/*
+	 * Without an external detect gpio, gpio_level_insert selects the
+	 * polarity of the codec's own mechanical insert comparator. Boards
+	 * whose jack switch closes on insertion instead of on removal must
+	 * flip it, otherwise the codec reports a plug whenever the jack is
+	 * empty and the HAL never routes to the speaker.
+	 */
+	if (of_property_read_bool(pdev->dev.of_node,
+				  "qcom,mbhc-insert-detect-inverted")) {
+		mbhc_cfg.gpio_level_insert = 0;
+		dev_info(&pdev->dev, "jack insert detection is inverted\n");
+	}
+
 	/* Parse US-Euro gpio info from DT. Report no error if us-euro
 	 * entry is not found in DT file as some targets do not support
 	 * US-Euro detection
