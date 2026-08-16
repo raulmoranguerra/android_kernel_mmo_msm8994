@@ -2,14 +2,19 @@
 	status = "okay";
 	
 	pn547@28 {
-		compatible = "nxp,pn547";
+		compatible = "nxp,pn547", "qcom,nq-nci";
 		reg = <0x28>;
 		status = "ok";
 		nxp,gpio_irq = <&msm_gpio 29 0x00>;
 		nxp,gpio_ven = <&msm_gpio 30 0x00>;
 		nxp,gpio_mode = <&msm_gpio 94 0x00>; //firmware pin
+		qcom,nq-irq = <&msm_gpio 29 0x00>;
+		qcom,nq-ven = <&msm_gpio 30 0x00>;
+		qcom,nq-firm = <&msm_gpio 94 0x00>;
 		nxp,i2c-pull-up = <1>;
 		qcom,clk-src = "BBCLK2";
+		clocks = <&clock_rpm clk_bb_clk2_pin>;
+		clock-names = "ref_clk";
 		interrupt-parent = <&msm_gpio>;
 		interrupts = <29 0>;
 		interrupt-names = "nfc_irq";
