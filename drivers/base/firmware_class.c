@@ -1710,7 +1710,7 @@ static void __device_uncache_fw_images(void)
  * then the device driver can load its firmwares easily at
  * time when system is not ready to complete loading firmware.
  */
-static void device_cache_fw_images(void)
+static void __maybe_unused device_cache_fw_images(void)
 {
 	struct firmware_cache *fwc = &fw_cache;
 	int old_timeout;
@@ -1779,7 +1779,13 @@ static int fw_pm_notify(struct notifier_block *notify_block,
 	switch (mode) {
 	case PM_HIBERNATION_PREPARE:
 	case PM_SUSPEND_PREPARE:
-		device_cache_fw_images();
+		/*
+		 * Skip device_cache_fw_images(). On talkman that call
+		 * never returns and the PMIC cuts power, which looks
+		 * like a silent reboot on lock / screen-off. The cache
+		 * is only an optimization so drivers can request
+		 * firmware while userspace is still frozen on resume.
+		 */
 		break;
 
 	case PM_POST_SUSPEND:
