@@ -1,0 +1,82 @@
+/*
+ * Talkman AP-side sensor I2C buses.
+ *
+ * Mainline reference: msm8994-msft-lumia-octagon.dtsi
+ * (Gustave Monce / Konrad Dybcio).
+ *
+ *   BLSP1 QUP5 (i2c@f9927000, GPIO 23/24) — ICM-20648, AK09912, ZPA2326
+ *   BLSP2 QUP1 (i2c@f9963000, GPIO 43/44) — QPDS-T900 / APDS-9930
+ *
+ * The chips are driven from userspace (sensors.talkman). Do not bind
+ * invn,mpu6050: 0x68 is ICM-20648-class (WHO 0xAB) and boots asleep.
+ *
+ * Do not include common/i2c.dtsi. That sketch was never wired, points
+ * at the NFC pinctrl (i2c_6), and uses the wrong master-id.
+ */
+
+/ {
+	aliases {
+		i2c4 = &i2c_4;
+		i2c7 = &i2c_7;
+	};
+};
+
+/*
+ * 1.8 V load switch for the IMU / magnetometer / barometer VID rail.
+ * Already labelled in msm8992-regulator.dtsi.
+ */
+&pm8994_lvs2 {
+	regulator-always-on;
+};
+
+&soc {
+	/* BLSP1 QUP5 — mainline &blsp1_i2c5 */
+	i2c_4: i2c@f9927000 {
+		compatible = "qcom,i2c-msm-v2";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "ok";
+		reg-names = "qup_phys_addr";
+		reg = <0xf9927000 0x1000>;
+		interrupt-names = "qup_irq";
+		interrupts = <0 99 0>;
+		qcom,clk-freq-out = <400000>;
+		qcom,clk-freq-in  = <19200000>;
+		clock-names = "iface_clk", "core_clk";
+		clocks = <&clock_gcc clk_gcc_blsp1_ahb_clk>,
+			 <&clock_gcc clk_gcc_blsp1_qup5_i2c_apps_clk>;
+
+		pinctrl-names = "i2c_active", "i2c_sleep";
+		pinctrl-0 = <&i2c_4_sda_active &i2c_4_scl_active>;
+		pinctrl-1 = <&i2c_4_sda_sleep &i2c_4_scl_sleep>;
+		qcom,noise-rjct-scl = <0>;
+		qcom,noise-rjct-sda = <0>;
+		qcom,disable-dma;
+		qcom,master-id = <86>;
+	};
+
+	/* BLSP2 QUP1 — mainline &blsp2_i2c1 */
+	i2c_7: i2c@f9963000 {
+		compatible = "qcom,i2c-msm-v2";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "ok";
+		reg-names = "qup_phys_addr";
+		reg = <0xf9963000 0x1000>;
+		interrupt-names = "qup_irq";
+		interrupts = <0 101 0>;
+		qcom,clk-freq-out = <400000>;
+		qcom,clk-freq-in  = <19200000>;
+		clock-names = "iface_clk", "core_clk";
+		clocks = <&clock_gcc clk_gcc_blsp2_ahb_clk>,
+			 <&clock_gcc clk_gcc_blsp2_qup1_i2c_apps_clk>;
+
+		pinctrl-names = "i2c_active", "i2c_sleep";
+		pinctrl-0 = <&i2c_7_active>;
+		pinctrl-1 = <&i2c_7_sleep>;
+		qcom,noise-rjct-scl = <0>;
+		qcom,noise-rjct-sda = <0>;
+		qcom,disable-dma;
+		qcom,master-id = <84>;
+	};
+};

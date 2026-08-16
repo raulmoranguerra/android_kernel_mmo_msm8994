@@ -55,7 +55,7 @@
         /* NFC End */
 
 		pmx_i2c_7 {
-			qcom,pins = <&gp 43>, <&gp 44>; /* SDA, SCL */
+			qcom,pins = <&gp 43>, <&gp 44>; /* SDA, SCL — BLSP2 I2C1 */
 			qcom,num-grp-pins = <2>;
 			qcom,pin-func = <3>;
 			label = "pmx_i2c_7";
@@ -66,6 +66,46 @@
 			};
 	
 			i2c_7_sleep: i2c_7_sleep {
+				drive-strength = <2>;
+				bias-disable;
+			};
+		};
+
+		/*
+		 * IMU / mag / baro on BLSP1 QUP5 (mainline blsp1_i2c5).
+		 * Unlike GPIO 27/28 and 43/44, these two pins do not share
+		 * the same mux index: 23 is func 4, 24 is func 5.
+		 * pin-func 3 here is UART/SPI and the chips never ACK.
+		 */
+		pmx_i2c_4_sda {
+			qcom,pins = <&gp 23>;
+			qcom,num-grp-pins = <1>;
+			qcom,pin-func = <4>;
+			label = "pmx_i2c_4_sda";
+
+			i2c_4_sda_active: i2c_4_sda_active {
+				drive-strength = <2>;
+				bias-disable;
+			};
+
+			i2c_4_sda_sleep: i2c_4_sda_sleep {
+				drive-strength = <2>;
+				bias-disable;
+			};
+		};
+
+		pmx_i2c_4_scl {
+			qcom,pins = <&gp 24>;
+			qcom,num-grp-pins = <1>;
+			qcom,pin-func = <5>;
+			label = "pmx_i2c_4_scl";
+
+			i2c_4_scl_active: i2c_4_scl_active {
+				drive-strength = <2>;
+				bias-disable;
+			};
+
+			i2c_4_scl_sleep: i2c_4_scl_sleep {
 				drive-strength = <2>;
 				bias-disable;
 			};
