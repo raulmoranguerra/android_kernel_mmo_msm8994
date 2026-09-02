@@ -69,5 +69,7 @@ int msm_camera_request_gpio_table(struct gpio *gpio_tbl, uint8_t size,
 
 /* Talkman: MMSS MCLK0 RCG/CBCR + GPIO13 TLMM. fix re-latches 24 MHz. */
 void msm_cam_dump_mclk0_pad(const char *why, int fix);
+/* Talkman: clock a wedged CCI I2C bus free through TLMM. Returns SDA level. */
+int msm_cam_talkman_i2c_bus_recover(u32 sda_gpio, u32 scl_gpio);
 
 #endif
