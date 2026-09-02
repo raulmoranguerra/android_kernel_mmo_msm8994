@@ -75,7 +75,8 @@
 		 */
 		qcom,csi-lane-assign = <0x0423>;
 		qcom,csi-lane-mask = <0x1F>;
-		qcom,mount-angle = <360>;
+		/* HAL1 dumpsys Orientation was 0 with 360. Rear module is 90. */
+		qcom,mount-angle = <90>;
 		cam_vdig-supply = <&pm8994_l25>;
 		cam_vana-supply = <&pm8994_l29>;
 		cam_vaf-supply = <&pm8994_l23>;
