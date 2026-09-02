@@ -88,6 +88,10 @@ struct csiphy_device {
 	struct regulator *reg_ptr;
 };
 
+int msm_csiphy_csid_sync(uint8_t phy_sel, uint8_t csid_id,
+	uint8_t lane_cnt, uint16_t lane_assign, uint32_t csi_clk);
+void msm_csiphy_dump_all(const char *why);
+
 #define VIDIOC_MSM_CSIPHY_RELEASE \
 	_IOWR('V', BASE_VIDIOC_PRIVATE + 9, void *)
 #endif

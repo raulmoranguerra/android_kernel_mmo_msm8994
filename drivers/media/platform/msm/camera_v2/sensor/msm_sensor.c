@@ -17,9 +17,155 @@
 #include "msm_camera_i2c_mux.h"
 #include <linux/regulator/rpm-smd-regulator.h>
 #include <linux/regulator/consumer.h>
+#include <linux/delay.h>
 
 #undef CDBG
 #define CDBG(fmt, args...) pr_debug(fmt, ##args)
+
+void msm_csid_dump_all(const char *why);
+void msm_csiphy_dump_all(const char *why);
+
+/* 32-bit mm-camera sometimes ships addr+data only (4 bytes). Kernel
+ * msm_camera_i2c_reg_array also has delay (8 bytes). */
+struct msm_camera_i2c_reg_array_u32 {
+	uint16_t reg_addr;
+	uint16_t reg_data;
+} __packed;
+
+static int msm_sensor_copy_i2c_reg_array(
+	struct msm_camera_i2c_reg_array **dst, const void __user *src,
+	uint16_t size)
+{
+	struct msm_camera_i2c_reg_array *k;
+	struct msm_camera_i2c_reg_array_u32 *u;
+	uint16_t i;
+
+	if (!dst || !src || !size)
+		return -EINVAL;
+	k = kzalloc(size * sizeof(*k), GFP_KERNEL);
+	if (!k)
+		return -ENOMEM;
+	if (!copy_from_user(k, src, size * sizeof(*k))) {
+		*dst = k;
+		return 0;
+	}
+	u = kzalloc(size * sizeof(*u), GFP_KERNEL);
+	if (!u) {
+		kfree(k);
+		return -ENOMEM;
+	}
+	if (copy_from_user(u, src, size * sizeof(*u))) {
+		kfree(u);
+		kfree(k);
+		return -EFAULT;
+	}
+	for (i = 0; i < size; i++) {
+		k[i].reg_addr = u[i].reg_addr;
+		k[i].reg_data = u[i].reg_data;
+		k[i].delay = 0;
+	}
+	kfree(u);
+	*dst = k;
+	return 0;
+}
+
+static void msm_sensor_misc_regulator(struct msm_sensor_ctrl_t *sctrl,
+	uint32_t enable);
+
+static int msm_sensor_ensure_power_up(struct msm_sensor_ctrl_t *s_ctrl)
+{
+	int32_t rc;
+
+	if (s_ctrl->sensor_state == MSM_SENSOR_POWER_UP)
+		return 0;
+	pr_info("%s: %s sensor_state=%d, power-up before I2C\n",
+		__func__, s_ctrl->sensordata->sensor_name,
+		s_ctrl->sensor_state);
+	if (!s_ctrl->func_tbl || !s_ctrl->func_tbl->sensor_power_up)
+		return -EFAULT;
+	if (s_ctrl->sensordata->misc_regulator)
+		msm_sensor_misc_regulator(s_ctrl, 1);
+	rc = s_ctrl->func_tbl->sensor_power_up(s_ctrl);
+	if (rc < 0) {
+		pr_err("%s: %s power-up failed rc %d\n",
+			__func__, s_ctrl->sensordata->sensor_name, rc);
+		return rc;
+	}
+	s_ctrl->sensor_state = MSM_SENSOR_POWER_UP;
+	return 0;
+}
+
+#ifdef CONFIG_COMPAT
+static void msm_sensor_log_i2c_setting32(const char *tag, int state,
+	uint32_t setting, const uint32_t *raw,
+	const struct msm_camera_i2c_reg_setting32 *s32)
+{
+	pr_err("%s: %s state=%d setting=0x%x raw %08x %08x %08x %08x %08x ptr=0x%x size=%u addr_t=%d data_t=%d delay=%u\n",
+		__func__, tag, state, setting,
+		raw[0], raw[1], raw[2], raw[3], raw[4],
+		s32->reg_setting, s32->size, s32->addr_type,
+		s32->data_type, s32->delay);
+}
+#endif
+
+static void msm_sensor_log_i2c_regs(const char *tag,
+	const struct msm_camera_i2c_reg_array *r, uint16_t size)
+{
+	int i, n;
+
+	if (!r || !size)
+		return;
+	n = size < 8 ? size : 8;
+	for (i = 0; i < n; i++)
+		pr_info("%s: %s [%d/%u] addr=0x%04x data=0x%04x delay=%u\n",
+			__func__, tag, i, size, r[i].reg_addr, r[i].reg_data,
+			r[i].delay);
+}
+
+static void msm_sensor_stream_on_probe(struct msm_sensor_ctrl_t *s_ctrl,
+	const struct msm_camera_i2c_reg_array *r, uint16_t size, int rc_write)
+{
+	int i, saw = 0;
+	uint16_t mode = 0xffff, model = 0xffff, lanes = 0xffff;
+
+	if (!r || !size)
+		return;
+	if (size == 1)
+		saw = 1;
+	for (i = 0; i < size; i++) {
+		if (r[i].reg_addr == 0x0100)
+			saw = 1;
+	}
+	if (!saw)
+		return;
+
+	pr_info("%s: stream-on I2C write rc=%d size=%u first=0x%04x=0x%04x (vs CSID CFG earlier)\n",
+		__func__, rc_write, size, r[0].reg_addr, r[0].reg_data);
+	msm_cam_dump_mclk0_pad("stream_on_i2c", 1);
+
+	if (s_ctrl && s_ctrl->sensor_i2c_client &&
+	    s_ctrl->sensor_i2c_client->i2c_func_tbl &&
+	    s_ctrl->sensor_i2c_client->i2c_func_tbl->i2c_read) {
+		s_ctrl->sensor_i2c_client->i2c_func_tbl->i2c_read(
+			s_ctrl->sensor_i2c_client, 0x0100, &mode,
+			MSM_CAMERA_I2C_BYTE_DATA);
+		s_ctrl->sensor_i2c_client->i2c_func_tbl->i2c_read(
+			s_ctrl->sensor_i2c_client, 0x0000, &model,
+			MSM_CAMERA_I2C_WORD_DATA);
+		s_ctrl->sensor_i2c_client->i2c_func_tbl->i2c_read(
+			s_ctrl->sensor_i2c_client, 0x0114, &lanes,
+			MSM_CAMERA_I2C_BYTE_DATA);
+		pr_info("%s: readback 0x0100(MODE)=0x%x 0x0000(model)=0x%x 0x0114(lanes)=0x%x\n",
+			__func__, mode, model, lanes);
+		/* IMX230 CSI_LANE_MODE: 0x1 = 2 lanes, 0x3 = 4 lanes */
+		if (lanes != 0x3)
+			pr_info("%s: 0x0114=0x%x is not 4-lane (0x3); CSI0 lane map comes from DT qcom,csi-lane-assign\n",
+				__func__, lanes);
+	}
+	msleep(50);
+	msm_csid_dump_all("after_stream_on");
+	msm_csiphy_dump_all("after_stream_on");
+}
 
 static struct v4l2_file_operations msm_sensor_v4l2_subdev_fops;
 static void msm_sensor_adjust_mclk(struct msm_camera_power_ctrl_t *ctrl)
@@ -672,6 +818,9 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 	mutex_lock(s_ctrl->msm_sensor_mutex);
 	CDBG("%s:%d %s cfgtype = %d\n", __func__, __LINE__,
 		s_ctrl->sensordata->sensor_name, cdata->cfgtype);
+	pr_info("%s: %s cfgtype=%d state=%d\n", __func__,
+		s_ctrl->sensordata->sensor_name, cdata->cfgtype,
+		s_ctrl->sensor_state);
 	switch (cdata->cfgtype) {
 	case CFG_GET_SENSOR_INFO:
 		memcpy(cdata->cfg.sensor_info.sensor_name,
@@ -725,13 +874,11 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 		struct msm_camera_i2c_reg_setting32 conf_array32;
 		struct msm_camera_i2c_reg_setting conf_array;
 		struct msm_camera_i2c_reg_array *reg_setting = NULL;
+		uint32_t raw[5] = {0, 0, 0, 0, 0};
 
-		if (s_ctrl->sensor_state != MSM_SENSOR_POWER_UP) {
-			pr_err("%s:%d failed: invalid state %d\n", __func__,
-				__LINE__, s_ctrl->sensor_state);
-			rc = -EFAULT;
+		rc = msm_sensor_ensure_power_up(s_ctrl);
+		if (rc < 0)
 			break;
-		}
 
 		if (copy_from_user(&conf_array32,
 			(void *)compat_ptr(cdata->cfg.setting),
@@ -740,6 +887,9 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 			rc = -EFAULT;
 			break;
 		}
+		if (copy_from_user(raw, (void *)compat_ptr(cdata->cfg.setting),
+			sizeof(raw)))
+			memset(raw, 0, sizeof(raw));
 
 		conf_array.addr_type = conf_array32.addr_type;
 		conf_array.data_type = conf_array32.data_type;
@@ -747,35 +897,43 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 		conf_array.size = conf_array32.size;
 		conf_array.reg_setting = compat_ptr(conf_array32.reg_setting);
 
-		if (!conf_array.size ||
+		msm_sensor_log_i2c_setting32("WRITE_I2C_ARRAY",
+			s_ctrl->sensor_state, cdata->cfg.setting,
+			raw, &conf_array32);
+
+		if (!conf_array.reg_setting || !conf_array.size ||
 			conf_array.size > I2C_REG_DATA_MAX) {
-			pr_err("%s:%d failed\n", __func__, __LINE__);
-			rc = -EFAULT;
+			/* 0x9004 is IMX230 stream-on in mot_imx230.so.
+			 * Seeing it as size with a NULL pointer means the
+			 * 32-bit daemon passed a pointer 4 bytes into an
+			 * 8-byte msm_camera_i2c_reg_array, not the setting
+			 * struct. Do not fake success. */
+			pr_err("%s: WRITE_I2C_ARRAY garbage or missing table\n",
+				__func__);
+			rc = -EINVAL;
 			break;
 		}
 
-		reg_setting = kzalloc(conf_array.size *
-			(sizeof(struct msm_camera_i2c_reg_array)), GFP_KERNEL);
-		if (!reg_setting) {
-			pr_err("%s:%d failed\n", __func__, __LINE__);
-			rc = -ENOMEM;
-			break;
-		}
-		if (copy_from_user(reg_setting,
-			(void *)(conf_array.reg_setting),
-			conf_array.size *
-			sizeof(struct msm_camera_i2c_reg_array))) {
-			pr_err("%s:%d failed\n", __func__, __LINE__);
-			kfree(reg_setting);
-			rc = -EFAULT;
+		rc = msm_sensor_copy_i2c_reg_array(&reg_setting,
+			(void __user *)conf_array.reg_setting, conf_array.size);
+		if (rc < 0) {
+			pr_err("%s:%d failed rc %d size %u ptr %pK\n", __func__,
+				__LINE__, rc, conf_array.size,
+				conf_array.reg_setting);
 			break;
 		}
 
 		conf_array.reg_setting = reg_setting;
 
+		msm_sensor_log_i2c_regs("WRITE_I2C_ARRAY",
+			reg_setting, conf_array.size);
 		rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->
 			i2c_write_table(s_ctrl->sensor_i2c_client,
 			&conf_array);
+		pr_info("%s: WRITE_I2C_ARRAY size=%u rc=%d\n",
+			__func__, conf_array.size, rc);
+		msm_sensor_stream_on_probe(s_ctrl, reg_setting,
+			conf_array.size, rc);
 		kfree(reg_setting);
 		break;
 	}
@@ -784,6 +942,13 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 		struct msm_camera_i2c_read_config *read_config_ptr = NULL;
 		uint16_t local_data = 0;
 		uint16_t orig_slave_addr = 0, read_slave_addr = 0;
+
+		/* Clark mot_imx230 reads revision (CFG_SLAVE_READ_I2C)
+		 * from imx230_sensor_write_init_settings before / without
+		 * a prior CFG_POWER_UP. CCI1 NACK while sensor_state==0. */
+		rc = msm_sensor_ensure_power_up(s_ctrl);
+		if (rc < 0)
+			break;
 
 		read_config_ptr =
 			(struct msm_camera_i2c_read_config *)
@@ -796,9 +961,15 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 			break;
 		}
 		read_slave_addr = read_config.slave_addr;
-		CDBG("%s:CFG_SLAVE_READ_I2C:", __func__);
-		CDBG("%s:slave_addr=0x%x reg_addr=0x%x, data_type=%d\n",
-			__func__, read_config.slave_addr,
+		/* Talkman IMX230 ACKed write 0x20. Clark revision
+		 * path still passes 0x34 in this ioctl. Prefer DT/probe. */
+		if (s_ctrl->sensordata && s_ctrl->sensordata->slave_info &&
+		    s_ctrl->sensordata->slave_info->sensor_slave_addr)
+			read_slave_addr =
+				s_ctrl->sensordata->slave_info->
+				sensor_slave_addr;
+		pr_info("%s: CFG_SLAVE_READ_I2C usr=0x%x use=0x%x reg=0x%x dt=%d\n",
+			__func__, read_config.slave_addr, read_slave_addr,
 			read_config.reg_addr, read_config.data_type);
 		if (s_ctrl->sensor_i2c_client->cci_client) {
 			orig_slave_addr =
@@ -815,15 +986,20 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 			rc = -EFAULT;
 			break;
 		}
-		CDBG("%s:orig_slave_addr=0x%x, new_slave_addr=0x%x",
-				__func__, orig_slave_addr,
-				read_slave_addr >> 1);
 		rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->i2c_read(
 				s_ctrl->sensor_i2c_client,
 				read_config.reg_addr,
 				&local_data, read_config.data_type);
+		if (s_ctrl->sensor_i2c_client->cci_client)
+			s_ctrl->sensor_i2c_client->cci_client->sid =
+				orig_slave_addr;
+		else if (s_ctrl->sensor_i2c_client->client)
+			s_ctrl->sensor_i2c_client->client->addr =
+				orig_slave_addr;
 		if (rc < 0) {
-			pr_err("%s:%d: i2c_read failed\n", __func__, __LINE__);
+			pr_err("%s:%d: i2c_read failed use=0x%x reg=0x%x\n",
+				__func__, __LINE__, read_slave_addr,
+				read_config.reg_addr);
 			break;
 		}
 		read_config_ptr->data = local_data;
@@ -879,14 +1055,35 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 		}
 
 		conf_array.reg_setting = reg_setting;
+		pr_info("%s: SEQ_ARRAY size=%u addr[0]=0x%04x len=%u data=%02x %02x %02x %02x delay=%u\n",
+			__func__, conf_array.size,
+			reg_setting[0].reg_addr, reg_setting[0].reg_data_size,
+			reg_setting[0].reg_data[0], reg_setting[0].reg_data[1],
+			reg_setting[0].reg_data[2], reg_setting[0].reg_data[3],
+			conf_array.delay);
 		rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->
 			i2c_write_seq_table(s_ctrl->sensor_i2c_client,
 			&conf_array);
+		pr_info("%s: SEQ_ARRAY rc=%d\n", __func__, rc);
+		if (reg_setting[0].reg_addr == 0x0100) {
+			struct msm_camera_i2c_reg_array tmp = {
+				.reg_addr = 0x0100,
+				.reg_data = reg_setting[0].reg_data[0],
+			};
+
+			msm_sensor_stream_on_probe(s_ctrl, &tmp, 1, rc);
+		}
 		kfree(reg_setting);
 		break;
 	}
 
 	case CFG_POWER_UP:
+		if (s_ctrl->sensor_state == MSM_SENSOR_POWER_UP) {
+			pr_info("%s: %s already POWER_UP\n", __func__,
+				s_ctrl->sensordata->sensor_name);
+			rc = 0;
+			break;
+		}
 		if (s_ctrl->sensor_state != MSM_SENSOR_POWER_DOWN) {
 			pr_err("%s:%d failed: invalid state %d\n", __func__,
 				__LINE__, s_ctrl->sensor_state);
@@ -906,6 +1103,7 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 			s_ctrl->sensor_state = MSM_SENSOR_POWER_UP;
 			CDBG("%s:%d sensor state %d\n", __func__, __LINE__,
 				s_ctrl->sensor_state);
+			msm_cam_dump_mclk0_pad("cfg_power_up", 1);
 		} else {
 			rc = -EFAULT;
 		}
@@ -914,9 +1112,9 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 		kfree(s_ctrl->stop_setting.reg_setting);
 		s_ctrl->stop_setting.reg_setting = NULL;
 		if (s_ctrl->sensor_state != MSM_SENSOR_POWER_UP) {
-			pr_err("%s:%d failed: invalid state %d\n", __func__,
+			pr_err("%s:%d power down skipped, state %d\n", __func__,
 				__LINE__, s_ctrl->sensor_state);
-			rc = -EFAULT;
+			rc = 0;
 			break;
 		}
 		if (s_ctrl->func_tbl->sensor_power_down) {
@@ -941,6 +1139,8 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 		struct msm_camera_i2c_reg_setting *stop_setting =
 			&s_ctrl->stop_setting;
 		struct msm_camera_i2c_reg_array *reg_setting = NULL;
+		uint32_t raw[5] = {0, 0, 0, 0, 0};
+
 		if (copy_from_user(&stop_setting32,
 				(void *)compat_ptr((cdata->cfg.setting)),
 			sizeof(struct msm_camera_i2c_reg_setting32))) {
@@ -948,36 +1148,41 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 			rc = -EFAULT;
 			break;
 		}
+		if (copy_from_user(raw, (void *)compat_ptr(cdata->cfg.setting),
+			sizeof(raw)))
+			memset(raw, 0, sizeof(raw));
+		msm_sensor_log_i2c_setting32("STOP_STREAM",
+			s_ctrl->sensor_state, cdata->cfg.setting,
+			raw, &stop_setting32);
 
 		stop_setting->addr_type = stop_setting32.addr_type;
 		stop_setting->data_type = stop_setting32.data_type;
 		stop_setting->delay = stop_setting32.delay;
 		stop_setting->size = stop_setting32.size;
-
 		reg_setting = compat_ptr(stop_setting32.reg_setting);
 
 		if (!stop_setting->size) {
-			pr_err("%s:%d failed\n", __func__, __LINE__);
-			rc = -EFAULT;
+			stop_setting->reg_setting = NULL;
+			rc = 0;
 			break;
 		}
-		stop_setting->reg_setting = kzalloc(stop_setting->size *
-			(sizeof(struct msm_camera_i2c_reg_array)), GFP_KERNEL);
-		if (!stop_setting->reg_setting) {
-			pr_err("%s:%d failed\n", __func__, __LINE__);
-			rc = -ENOMEM;
-			break;
-		}
-		if (copy_from_user(stop_setting->reg_setting,
-			(void *)reg_setting,
-			stop_setting->size *
-			sizeof(struct msm_camera_i2c_reg_array))) {
-			pr_err("%s:%d failed\n", __func__, __LINE__);
-			kfree(stop_setting->reg_setting);
+		if (!reg_setting || stop_setting->size > I2C_REG_DATA_MAX) {
+			pr_err("%s: STOP_STREAM garbage size %u ptr %pK (0x9004 is IMX230 reg, not a table length)\n",
+				__func__, stop_setting->size, reg_setting);
 			stop_setting->reg_setting = NULL;
 			stop_setting->size = 0;
-			rc = -EFAULT;
+			rc = -EINVAL;
 			break;
+		}
+		rc = msm_sensor_copy_i2c_reg_array(&stop_setting->reg_setting,
+			(void __user *)reg_setting, stop_setting->size);
+		if (rc < 0) {
+			pr_err("%s:%d stop stream copy failed size %u ptr %pK rc %d\n",
+				__func__, __LINE__, stop_setting->size,
+				reg_setting, rc);
+			stop_setting->reg_setting = NULL;
+			stop_setting->size = 0;
+			/* Missing table is a userspace bug; do not fake 0. */
 		}
 		break;
 	}
@@ -1093,8 +1298,14 @@ int msm_sensor_config(struct msm_sensor_ctrl_t *s_ctrl, void __user *argp)
 		}
 
 		conf_array.reg_setting = reg_setting;
+		msm_sensor_log_i2c_regs("WRITE_I2C_ARRAY",
+			reg_setting, conf_array.size);
 		rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->i2c_write_table(
 			s_ctrl->sensor_i2c_client, &conf_array);
+		pr_info("%s: WRITE_I2C_ARRAY size=%u rc=%d\n",
+			__func__, conf_array.size, rc);
+		msm_sensor_stream_on_probe(s_ctrl, reg_setting,
+			conf_array.size, rc);
 		kfree(reg_setting);
 		break;
 	}
@@ -1269,14 +1480,35 @@ int msm_sensor_config(struct msm_sensor_ctrl_t *s_ctrl, void __user *argp)
 		}
 
 		conf_array.reg_setting = reg_setting;
+		pr_info("%s: SEQ_ARRAY size=%u addr[0]=0x%04x len=%u data=%02x %02x %02x %02x delay=%u\n",
+			__func__, conf_array.size,
+			reg_setting[0].reg_addr, reg_setting[0].reg_data_size,
+			reg_setting[0].reg_data[0], reg_setting[0].reg_data[1],
+			reg_setting[0].reg_data[2], reg_setting[0].reg_data[3],
+			conf_array.delay);
 		rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->
 			i2c_write_seq_table(s_ctrl->sensor_i2c_client,
 			&conf_array);
+		pr_info("%s: SEQ_ARRAY rc=%d\n", __func__, rc);
+		if (reg_setting[0].reg_addr == 0x0100) {
+			struct msm_camera_i2c_reg_array tmp = {
+				.reg_addr = 0x0100,
+				.reg_data = reg_setting[0].reg_data[0],
+			};
+
+			msm_sensor_stream_on_probe(s_ctrl, &tmp, 1, rc);
+		}
 		kfree(reg_setting);
 		break;
 	}
 
 	case CFG_POWER_UP:
+		if (s_ctrl->sensor_state == MSM_SENSOR_POWER_UP) {
+			pr_info("%s: %s already POWER_UP\n", __func__,
+				s_ctrl->sensordata->sensor_name);
+			rc = 0;
+			break;
+		}
 		if (s_ctrl->sensor_state != MSM_SENSOR_POWER_DOWN) {
 			pr_err("%s:%d failed: invalid state %d\n", __func__,
 				__LINE__, s_ctrl->sensor_state);
@@ -1296,6 +1528,7 @@ int msm_sensor_config(struct msm_sensor_ctrl_t *s_ctrl, void __user *argp)
 			s_ctrl->sensor_state = MSM_SENSOR_POWER_UP;
 			CDBG("%s:%d sensor state %d\n", __func__, __LINE__,
 				s_ctrl->sensor_state);
+			msm_cam_dump_mclk0_pad("cfg_power_up", 1);
 		} else {
 			rc = -EFAULT;
 		}

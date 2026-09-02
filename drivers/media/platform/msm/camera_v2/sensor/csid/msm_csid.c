@@ -14,6 +14,9 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/irqreturn.h>
+#ifdef CONFIG_COMPAT
+#include <linux/compat.h>
+#endif
 #include "msm_csid.h"
 #include "msm_sd.h"
 #include "msm_camera_io_util.h"
@@ -22,6 +25,7 @@
 #include "include/msm_csid_3_0_hwreg.h"
 #include "include/msm_csid_3_1_hwreg.h"
 #include "include/msm_csid_3_2_hwreg.h"
+#include "../csiphy/msm_csiphy.h"
 
 #define V4L2_IDENT_CSID                            50002
 #define CSID_VERSION_V20                      0x02000011
@@ -47,6 +51,8 @@
 
 static struct msm_cam_clk_info csid_clk_info[CSID_NUM_CLK_MAX];
 static struct msm_cam_clk_info csid_clk_src_info[CSID_NUM_CLK_MAX];
+#define MAX_CSID_DEV 4
+static struct csid_device *csid_devs[MAX_CSID_DEV];
 
 static struct camera_vreg_t csid_vreg_info[] = {
 	{"qcom,mipi-csi-vdd", 0, 0, 12000},
@@ -82,13 +88,12 @@ static int msm_csid_cid_lut(
 				 __func__, csid_lut_params->vc_cfg[i]->cid);
 			return -EINVAL;
 		}
-		CDBG("%s lut params num_cid = %d, cid = %d\n",
-			__func__,
-			csid_lut_params->num_cid,
-			csid_lut_params->vc_cfg[i]->cid);
-		CDBG("%s lut params dt = 0x%x, df = %d\n", __func__,
+		pr_info("%s: CSID%d cid[%d]=%u dt=0x%x df=%d num_cid=%d\n",
+			__func__, csid_dev->pdev->id, i,
+			csid_lut_params->vc_cfg[i]->cid,
 			csid_lut_params->vc_cfg[i]->dt,
-			csid_lut_params->vc_cfg[i]->decode_format);
+			csid_lut_params->vc_cfg[i]->decode_format,
+			csid_lut_params->num_cid);
 		if (csid_lut_params->vc_cfg[i]->dt < 0x12 ||
 			csid_lut_params->vc_cfg[i]->dt > 0x37) {
 			pr_err("%s: unsupported data type 0x%x\n",
@@ -114,21 +119,54 @@ static int msm_csid_cid_lut(
 	return rc;
 }
 
-#if DBG_CSID
+static void msm_csid_dump_stats(struct csid_device *csid_dev, const char *why,
+	uint32_t irq)
+{
+	uint32_t pkts, ecc, crc, hdr, core0, core1;
+
+	if (!csid_dev || !csid_dev->base)
+		return;
+	core0 = msm_camera_io_r(csid_dev->base +
+		csid_dev->ctrl_reg->csid_reg.csid_core_ctrl_0_addr);
+	core1 = msm_camera_io_r(csid_dev->base +
+		csid_dev->ctrl_reg->csid_reg.csid_core_ctrl_1_addr);
+	pkts = msm_camera_io_r(csid_dev->base +
+		csid_dev->ctrl_reg->csid_reg.csid_stats_total_pkts_rcvd_addr);
+	ecc = msm_camera_io_r(csid_dev->base +
+		csid_dev->ctrl_reg->csid_reg.csid_stats_ecc_addr);
+	crc = msm_camera_io_r(csid_dev->base +
+		csid_dev->ctrl_reg->csid_reg.csid_stats_crc_addr);
+	hdr = msm_camera_io_r(csid_dev->base +
+		csid_dev->ctrl_reg->csid_reg.csid_captured_long_pkt_hdr_addr);
+	pr_info("%s: CSID%d %s irq=0x%x core0=0x%x core1=0x%x pkts=%u ecc=0x%x crc=0x%x long_hdr=0x%x\n",
+		__func__, csid_dev->pdev->id, why, irq, core0, core1,
+		pkts, ecc, crc, hdr);
+}
+
+void msm_csid_dump_all(const char *why)
+{
+	int i;
+
+	for (i = 0; i < MAX_CSID_DEV; i++) {
+		if (csid_devs[i] && csid_devs[i]->csid_state == CSID_POWER_UP &&
+		    csid_devs[i]->base)
+			msm_csid_dump_stats(csid_devs[i], why, 0);
+	}
+}
+EXPORT_SYMBOL(msm_csid_dump_all);
+
+/*
+ * Kernel #24 unmasked 0x7f010800 | lanes<<20 unconditionally. CSID then
+ * stormed irq=0xe000cc (pkts still 0) and dump_stats pr_info in hardirq
+ * ate the ring buffer. Stats registers accumulate without those IRQs;
+ * dump after CFG and on AXI timeout. Do not enable CSID_TG_*.
+ */
 static void msm_csid_set_debug_reg(struct csid_device *csid_dev,
 	struct msm_camera_csid_params *csid_params)
 {
-	uint32_t val = 0;
-	val = ((1 << csid_params->lane_cnt) - 1) << 20;
-	msm_camera_io_w(0x7f010800 | val, csid_dev->base +
-		csid_dev->ctrl_reg->csid_reg.csid_irq_mask_addr);
-	msm_camera_io_w(0x7f010800 | val, csid_dev->base +
-		csid_dev->ctrl_reg->csid_reg.csid_irq_clear_cmd_addr);
+	(void)csid_dev;
+	(void)csid_params;
 }
-#else
-static void msm_csid_set_debug_reg(struct csid_device *csid_dev,
-	struct msm_camera_csid_params *csid_params) {}
-#endif
 
 static void msm_csid_reset(struct csid_device *csid_dev)
 {
@@ -153,12 +191,17 @@ static int msm_csid_config(struct csid_device *csid_dev,
 		return -EINVAL;
 	}
 
-	CDBG("%s csid_params, lane_cnt = %d, lane_assign = 0x%x\n",
-		__func__,
-		csid_params->lane_cnt,
-		csid_params->lane_assign);
-	CDBG("%s csid_params phy_sel = %d\n", __func__,
-		csid_params->phy_sel);
+	pr_info("%s: CSID%d lane_cnt=%u lane_assign=0x%x phy_sel=%u csi_clk=%u num_cid=%u state=%d\n",
+		__func__, csid_dev->pdev->id,
+		csid_params->lane_cnt, csid_params->lane_assign,
+		csid_params->phy_sel, csid_params->csi_clk,
+		csid_params->lut_params.num_cid, csid_dev->csid_state);
+
+	if (csid_params->lane_cnt < 1 || csid_params->lane_cnt > 4) {
+		pr_err("%s: invalid lane_cnt %u (talkman CSI0 is 4-lane 0x4320)\n",
+			__func__, csid_params->lane_cnt);
+		return -EINVAL;
+	}
 
 	msm_csid_reset(csid_dev);
 
@@ -168,19 +211,44 @@ static int msm_csid_config(struct csid_device *csid_dev,
 		return -EINVAL;
 	}
 
-	clk_rate = (csid_params->csi_clk > 0) ?
-				(csid_params->csi_clk) : csid_dev->csid_max_clk;
+	/* Clark libmmcamera_mot_imx230.so leaves csi_clk=0 in every
+	 * resolution. csi_src_clk must still be the DT PLL (266.67 MHz). */
+	clk_rate = csid_params->csi_clk;
+	if (clk_rate == 0) {
+		clk_rate = csid_dev->csid_max_clk;
+		if (clk_rate == 0)
+			clk_rate = 266670000;
+		pr_info("%s: CSID%d Clark csi_clk=0, using DT csi_src_clk %u idx=%u\n",
+			__func__, csid_dev->pdev->id, clk_rate,
+			csid_dev->csid_clk_index);
+	}
 	round_rate = clk_round_rate(csid_clk_ptr[csid_dev->csid_clk_index],
 					clk_rate);
-	if (round_rate > csid_dev->csid_max_clk)
+	if (csid_dev->csid_max_clk && round_rate > csid_dev->csid_max_clk)
 		round_rate = csid_dev->csid_max_clk;
-	pr_debug("usr set rate csi_clk clk_rate = %u round_rate = %u\n",
-					clk_rate, round_rate);
 	rc = clk_set_rate(csid_clk_ptr[csid_dev->csid_clk_index],
 				round_rate);
 	if (rc < 0) {
 		pr_err("csi_src_clk set failed\n");
 		return rc;
+	}
+	pr_info("%s: CSID%d csi_src_clk req=%u round=%u get_rate=%lu\n",
+		__func__, csid_dev->pdev->id, clk_rate, round_rate,
+		clk_get_rate(csid_clk_ptr[csid_dev->csid_clk_index]));
+
+	if (csid_dev->dt_lane_assign &&
+	    csid_dev->dt_lane_assign != csid_params->lane_assign) {
+		/*
+		 * Talkman (Lumia 950 RM-1104) routes the IMX230 data
+		 * lanes to CSI0_LN2/LN1/LN3/LN0 (DL0..DL3), i.e.
+		 * DL_INPUT_SEL 0x0423, while the Clark sensor library
+		 * requests 0x4320. Sweep of all 24 permutations on the
+		 * device: only 0x0423 gives ECC=0 and CRC=0 at CSID0.
+		 */
+		pr_info("%s: CSID%d lane_assign 0x%x -> DT 0x%x\n",
+			__func__, csid_dev->pdev->id,
+			csid_params->lane_assign, csid_dev->dt_lane_assign);
+		csid_params->lane_assign = csid_dev->dt_lane_assign;
 	}
 
 	val = csid_params->lane_cnt - 1;
@@ -205,6 +273,19 @@ static int msm_csid_config(struct csid_device *csid_dev,
 		return rc;
 
 	msm_csid_set_debug_reg(csid_dev, csid_params);
+	msm_csid_dump_stats(csid_dev, "after CFG", 0);
+
+	/* Clark daemon may skip VIDIOC_MSM_CSIPHY_IO_CFG. Bring up the
+	 * real PHY for this CSID (not the test generator). Pass the
+	 * applied csi_src_clk, not the raw 0 from chromatix. */
+	rc = msm_csiphy_csid_sync(csid_params->phy_sel, csid_dev->pdev->id,
+		csid_params->lane_cnt, csid_params->lane_assign,
+		round_rate);
+	if (rc < 0)
+		pr_err("%s: CSIPHY sync failed rc=%d (CSID still configured)\n",
+			__func__, rc);
+	else
+		rc = 0;
 	return rc;
 }
 
@@ -259,14 +340,17 @@ static int msm_csid_init(struct csid_device *csid_dev, uint32_t *csid_version)
 		return rc;
 	}
 
-	csid_dev->reg_ptr = NULL;
-
 	if (csid_dev->csid_state == CSID_POWER_UP) {
-		pr_err("%s: csid invalid state %d\n", __func__,
-			csid_dev->csid_state);
-		rc = -EINVAL;
-		return rc;
+		/* Clark mm-camera csid_open:124 CSID_INIT on a live
+		 * core after a failed session. Returning EINVAL here
+		 * is what userspace logs as VIDIOC_MSM_CSID_IO_CFG. */
+		*csid_version = csid_dev->hw_version;
+		pr_info("%s: CSID%d already POWER_UP ver=0x%x\n",
+			__func__, csid_dev->pdev->id, *csid_version);
+		return 0;
 	}
+
+	csid_dev->reg_ptr = NULL;
 
 	csid_dev->base = ioremap(csid_dev->mem->start,
 		resource_size(csid_dev->mem));
@@ -484,6 +568,9 @@ static int32_t msm_csid_cmd(struct csid_device *csid_dev, void __user *arg)
 		return -EINVAL;
 	}
 	CDBG("%s cfgtype = %d\n", __func__, cdata->cfgtype);
+	pr_info("%s: CSID%d cfgtype=%d state=%d cmd_native\n",
+		__func__, csid_dev->pdev->id, cdata->cfgtype,
+		csid_dev->csid_state);
 	switch (cdata->cfgtype) {
 	case CSID_INIT:
 		rc = msm_csid_init(csid_dev, &cdata->cfg.csid_version);
@@ -494,6 +581,16 @@ static int32_t msm_csid_cmd(struct csid_device *csid_dev, void __user *arg)
 		struct msm_camera_csid_params csid_params;
 		struct msm_camera_csid_vc_cfg *vc_cfg = NULL;
 		int8_t i = 0;
+
+		if (csid_dev->csid_state != CSID_POWER_UP) {
+			uint32_t ver = 0;
+
+			pr_err("%s: CSID_CFG while unpowered state=%d, auto INIT\n",
+				__func__, csid_dev->csid_state);
+			rc = msm_csid_init(csid_dev, &ver);
+			if (rc < 0)
+				break;
+		}
 		if (copy_from_user(&csid_params,
 			(void *)cdata->cfg.csid_params,
 			sizeof(struct msm_camera_csid_params))) {
@@ -562,6 +659,10 @@ static int32_t msm_csid_get_subdev_id(struct csid_device *csid_dev, void *arg)
 	return 0;
 }
 
+#ifdef CONFIG_COMPAT
+static int32_t msm_csid_cmd32(struct csid_device *csid_dev, void __user *arg);
+#endif
+
 static long msm_csid_subdev_ioctl(struct v4l2_subdev *sd,
 			unsigned int cmd, void *arg)
 {
@@ -574,14 +675,25 @@ static long msm_csid_subdev_ioctl(struct v4l2_subdev *sd,
 		rc = msm_csid_get_subdev_id(csid_dev, arg);
 		break;
 	case VIDIOC_MSM_CSID_IO_CFG:
-		rc = msm_csid_cmd(csid_dev, arg);
+#ifdef CONFIG_COMPAT
+		if (is_compat_task())
+			rc = msm_csid_cmd32(csid_dev, arg);
+		else
+#endif
+			rc = msm_csid_cmd(csid_dev, arg);
 		break;
+#ifdef CONFIG_COMPAT
+	case VIDIOC_MSM_CSID_IO_CFG32:
+		rc = msm_csid_cmd32(csid_dev, arg);
+		break;
+#endif
 	case VIDIOC_MSM_CSID_RELEASE:
 	case MSM_SD_SHUTDOWN:
 		rc = msm_csid_release(csid_dev);
 		break;
 	default:
-		pr_err_ratelimited("%s: command not found\n", __func__);
+		pr_err_ratelimited("%s: command not found cmd=0x%x\n",
+			__func__, cmd);
 	}
 	CDBG("%s:%d\n", __func__, __LINE__);
 	mutex_unlock(&csid_dev->mutex);
@@ -606,6 +718,9 @@ static int32_t msm_csid_cmd32(struct csid_device *csid_dev, void __user *arg)
 	}
 
 	CDBG("%s cfgtype = %d\n", __func__, cdata->cfgtype);
+	pr_info("%s: CSID%d cfgtype=%d state=%d cmd32\n",
+		__func__, csid_dev->pdev->id, cdata->cfgtype,
+		csid_dev->csid_state);
 	switch (cdata->cfgtype) {
 	case CSID_INIT:
 		rc = msm_csid_init(csid_dev, &cdata->cfg.csid_version);
@@ -621,6 +736,16 @@ static int32_t msm_csid_cmd32(struct csid_device *csid_dev, void __user *arg)
 		struct msm_camera_csid_lut_params32 lut_par32;
 		struct msm_camera_csid_params32 csid_params32;
 		struct msm_camera_csid_vc_cfg vc_cfg32;
+
+		if (csid_dev->csid_state != CSID_POWER_UP) {
+			uint32_t ver = 0;
+
+			pr_err("%s: CSID_CFG while unpowered state=%d, auto INIT\n",
+				__func__, csid_dev->csid_state);
+			rc = msm_csid_init(csid_dev, &ver);
+			if (rc < 0)
+				break;
+		}
 
 		if (copy_from_user(&csid_params32,
 			(void *)compat_ptr(arg32->cfg.csid_params),
@@ -716,7 +841,8 @@ static long msm_csid_subdev_ioctl32(struct v4l2_subdev *sd,
 		rc = msm_csid_release(csid_dev);
 		break;
 	default:
-		pr_err_ratelimited("%s: command not found\n", __func__);
+		pr_err_ratelimited("%s: command not found cmd=0x%x\n",
+			__func__, cmd);
 	}
 	CDBG("%s:%d\n", __func__, __LINE__);
 	mutex_unlock(&csid_dev->mutex);
@@ -918,6 +1044,16 @@ static int csid_probe(struct platform_device *pdev)
 
 		csid_vreg_info[0].min_voltage = csi_vdd_voltage;
 		csid_vreg_info[0].max_voltage = csi_vdd_voltage;
+
+		/* Optional board wiring override of the DL_INPUT_SEL
+		 * nibbles (DL3..DL0 -> PHY lane). Userspace sensor libs
+		 * carry the reference board's value; the PCB decides. */
+		new_csid_dev->dt_lane_assign = 0;
+		if (!of_property_read_u32((&pdev->dev)->of_node,
+			"qcom,csi-lane-assign", &new_csid_dev->dt_lane_assign))
+			pr_info("%s: CSID%d DT csi-lane-assign 0x%x\n",
+				__func__, pdev->id,
+				new_csid_dev->dt_lane_assign);
 	}
 
 	rc = msm_csid_get_clk_info(new_csid_dev, pdev);
@@ -1014,6 +1150,8 @@ static int csid_probe(struct platform_device *pdev)
 	}
 
 	new_csid_dev->csid_state = CSID_POWER_DOWN;
+	if (pdev->id >= 0 && pdev->id < MAX_CSID_DEV)
+		csid_devs[pdev->id] = new_csid_dev;
 	return 0;
 
 csid_no_resource:

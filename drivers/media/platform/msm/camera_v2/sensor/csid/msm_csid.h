@@ -60,6 +60,8 @@ struct csid_reg_parms_t {
 	uint32_t csid_version;
 };
 
+void msm_csid_dump_all(const char *why);
+
 struct csid_ctrl_t {
 	struct csid_reg_parms_t csid_reg;
 };
@@ -89,6 +91,7 @@ struct csid_device {
 	struct clk *csid_clk[CSID_NUM_CLK_MAX];
 	uint32_t csid_clk_index;
 	uint32_t csid_max_clk;
+	uint32_t dt_lane_assign;
 };
 
 #define VIDIOC_MSM_CSID_RELEASE \

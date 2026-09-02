@@ -1301,6 +1301,7 @@ int msm_camera_power_up(struct msm_camera_power_ctrl_t *ctrl,
 		if (ret)
 			pr_err("%s:%d cannot set pin to active state",
 				__func__, __LINE__);
+		msm_cam_dump_mclk0_pad("pinctrl_active", 1);
 	}
 	for (index = 0; index < ctrl->power_setting_size; index++) {
 		CDBG("%s index %d\n", __func__, index);
@@ -1397,6 +1398,7 @@ int msm_camera_power_up(struct msm_camera_power_ctrl_t *ctrl,
 		}
 	}
 
+	msm_cam_dump_mclk0_pad("power_up", 1);
 	CDBG("%s exit\n", __func__);
 	return 0;
 power_up_failed:

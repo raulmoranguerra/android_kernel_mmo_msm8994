@@ -1,0 +1,216 @@
+/*
+ * Lumia 950 RM-1104 (4VM_08r) camera. Schematic sheet 3 (page-02).
+ *
+ * Rear: CSI0 4-lane, CCI1, CAM_MCLK0 GPIO 13.
+ *       VREG_L25A_1P1 VDIG, VREG_L29A_2P8 VANA, VREG_L23A_2P8 VAF,
+ *       VREG_LVS1A_1P8 VIO (shared — always-on, not in cam-vreg seq).
+ *       TORCH_EN GPIO 12 (torch.dtsi). No PMI flash bind.
+ * Rear XSHUTDOWN is not labelled on the drawing — do not copy MTP 91/92.
+ *
+ * Front (disabled, no CameraId 1): CSI2, CCI0, CAM_MCLK2 GPIO 15,
+ *       CAM_FRONT_RES_N GPIO 104. GPIO 105 is not on the drawing.
+ * Iris (disabled): CCI0, CAM_MCLK1 GPIO 14, IRIS_CAM_RES_N GPIO 102.
+ *
+ * Rear qcom,slave-id is the on-device CCI1 ACK (write 0x20, id 0x0230).
+ * No OIS node. Do not use cam_sensor_rear2 (GPIO 94 = NFC DWL).
+ */
+
+&soc {
+	/*
+	 * CCI 7-bit SIDs are not in ACPI/DCC. Scanner driver
+	 * talkman_cci_scan.c; echo 1 > /sys/kernel/debug/talkman-cci-scan/scan
+	 * Rails match camera@0 (L25 VDIG, L29 VANA, L23 VAF). LVS1 always-on
+	 * cam_vio is for the scanner regulator_get only — not in cam-vreg seq.
+	 * Pinctrl is schematic MCLK0/MCLK2 only. CCI1 DATA/CLK GPIO 19/20 is
+	 * muxed by &cci (cci1_active), not by this node — do not claim
+	 * MTP 91/92/105.
+	 */
+	talkman-cci-scan {
+		compatible = "mmo,talkman-cci-scan";
+		status = "ok";
+		cam_vdig-supply = <&pm8994_l25>;
+		cam_vana-supply = <&pm8994_l29>;
+		cam_vaf-supply = <&pm8994_l23>;
+		cam_vio-supply = <&pm8994_lvs1>;
+		cam_vana_front-supply = <&pm8994_l17>;
+		clocks = <&clock_mmss clk_mclk0_clk_src>,
+			<&clock_mmss clk_camss_mclk0_clk>,
+			<&clock_mmss clk_mclk2_clk_src>,
+			<&clock_mmss clk_camss_mclk2_clk>;
+		clock-names = "mclk0_src", "mclk0", "mclk2_src", "mclk2";
+		qcom,mclk-rate = <24000000>;
+		pinctrl-names = "default", "scan";
+		pinctrl-0 = <&cam_sensor_mclk0_suspend
+			     &cam_sensor_mclk2_suspend>;
+		pinctrl-1 = <&cam_sensor_mclk0_active
+			     &cam_sensor_mclk2_active>;
+	};
+};
+
+&cci {
+	/*
+	 * RM-1104 schematic: CCI0 DATA/CLK = GPIO 17/18, CCI1 DATA/CLK =
+	 * GPIO 19/20 (rear). Restate CAF msm8992-camera.dtsi so a later
+	 * overlay cannot drop cci1_active while camera@0 stays on master 1.
+	 */
+	pinctrl-names = "cci_default", "cci_suspend";
+	pinctrl-0 = <&cci0_active &cci1_active>;
+	pinctrl-1 = <&cci0_suspend &cci1_suspend>;
+
+	qcom,camera@0 {
+		cell-index = <0>;
+		compatible = "qcom,camera";
+		reg = <0x0>;
+		qcom,sensor-name = "mot_imx230";
+		qcom,csiphy-sd-index = <0>;
+		qcom,csid-sd-index = <0>;
+		/*
+		 * RM-1104 rear connector (schematic sheet 3) wires the
+		 * IMX230 data lanes to CSI0_LN2/LN1/LN3/LN0 for DL0..DL3.
+		 * CSID DL_INPUT_SEL is therefore 0x0423 (PHY lanes 3,2,4,0),
+		 * not Clark's 0x4320. Verified on device: only 0x0423 of the
+		 * 24 permutations gives ECC=0/CRC=0 at CSID0 and a preview.
+		 * The same value is on the CSID0 node below because the
+		 * Clark sensor library hard-codes 0x4320 in CSID_CFG.
+		 */
+		qcom,csi-lane-assign = <0x0423>;
+		qcom,csi-lane-mask = <0x1F>;
+		qcom,mount-angle = <360>;
+		cam_vdig-supply = <&pm8994_l25>;
+		cam_vana-supply = <&pm8994_l29>;
+		cam_vaf-supply = <&pm8994_l23>;
+		qcom,cam-vreg-name = "cam_vdig", "cam_vana", "cam_vaf";
+		qcom,cam-vreg-min-voltage = <1150000 2850000 2850000>;
+		qcom,cam-vreg-max-voltage = <1150000 2850000 2850000>;
+		qcom,cam-vreg-op-mode = <105000 80000 100000>;
+		qcom,gpio-no-mux = <0>;
+		pinctrl-names = "cam_default", "cam_suspend";
+		pinctrl-0 = <&cam_sensor_mclk0_active>;
+		pinctrl-1 = <&cam_sensor_mclk0_suspend>;
+		gpios = <&msm_gpio 13 0>;
+		qcom,gpio-req-tbl-num = <0>;
+		qcom,gpio-req-tbl-flags = <1>;
+		qcom,gpio-req-tbl-label = "CAMIF_MCLK0";
+		qcom,cam-power-seq-type = "sensor_vreg", "sensor_vreg",
+			"sensor_vreg", "sensor_clk";
+		qcom,cam-power-seq-val = "cam_vdig", "cam_vana", "cam_vaf",
+			"sensor_cam_mclk";
+		/* Clark libmmcamera_mot_imx230.so votes 24 MHz INCK.
+		 * WOA PEP 9.6 MHz is enough for CCI; CSI PLL wants 24. */
+		qcom,cam-power-seq-cfg-val = <1 1 1 24000000>;
+		qcom,cam-power-seq-delay = <1 1 1 5>;
+		qcom,sensor-position = <0>;
+		qcom,sensor-mode = <0>;
+		qcom,cci-master = <1>;
+		/* On-device talkman-cci-scan 2026-09-02 kernel #17:
+		 * CCI1 ACK sid=0x10 wr=0x20 SMIA/Sony chip=0x0230 (IMX230).
+		 * CAF first cell is 8-bit write address. */
+		qcom,slave-id = <0x20 0x0016 0x0230>;
+		status = "ok";
+		clocks = <&clock_mmss clk_mclk0_clk_src>,
+			<&clock_mmss clk_camss_mclk0_clk>;
+		clock-names = "cam_src_clk", "cam_clk";
+	};
+
+	/* Front SMIA — schematic only. No CameraId 1 XML. No SID. */
+	qcom,camera@1 {
+		cell-index = <1>;
+		compatible = "qcom,camera";
+		reg = <0x1>;
+		qcom,csiphy-sd-index = <2>;
+		qcom,csid-sd-index = <2>;
+		qcom,mount-angle = <90>;
+		cam_vana-supply = <&pm8994_l17>;
+		qcom,cam-vreg-name = "cam_vana";
+		qcom,cam-vreg-min-voltage = <2800000>;
+		qcom,cam-vreg-max-voltage = <2800000>;
+		qcom,cam-vreg-op-mode = <80000>;
+		qcom,gpio-no-mux = <0>;
+		pinctrl-names = "cam_default", "cam_suspend";
+		pinctrl-0 = <&cam_sensor_mclk2_active &cam_sensor_front_rst_active>;
+		pinctrl-1 = <&cam_sensor_mclk2_suspend &cam_sensor_front_rst_suspend>;
+		gpios = <&msm_gpio 15 0>,
+			<&msm_gpio 104 0>;
+		qcom,gpio-reset = <1>;
+		qcom,gpio-req-tbl-num = <0 1>;
+		qcom,gpio-req-tbl-flags = <1 0>;
+		qcom,gpio-req-tbl-label = "CAMIF_MCLK2",
+					  "CAM_FRONT_RES_N";
+		qcom,sensor-position = <1>;
+		qcom,sensor-mode = <0>;
+		qcom,cci-master = <0>;
+		status = "disabled";
+		clocks = <&clock_mmss clk_mclk2_clk_src>,
+			<&clock_mmss clk_camss_mclk2_clk>;
+		clock-names = "cam_src_clk", "cam_clk";
+	};
+
+	/* Iris / SIIRI — schematic IRIS_CAM_RES_N GPIO 102, MCLK1 GPIO 14. */
+	qcom,camera@2 {
+		cell-index = <2>;
+		compatible = "qcom,camera";
+		reg = <0x2>;
+		qcom,csiphy-sd-index = <2>;
+		qcom,csid-sd-index = <2>;
+		qcom,mount-angle = <90>;
+		cam_vana-supply = <&pm8994_l17>;
+		qcom,cam-vreg-name = "cam_vana";
+		qcom,cam-vreg-min-voltage = <2800000>;
+		qcom,cam-vreg-max-voltage = <2800000>;
+		qcom,cam-vreg-op-mode = <80000>;
+		qcom,gpio-no-mux = <0>;
+		pinctrl-names = "cam_default", "cam_suspend";
+		pinctrl-0 = <&cam_sensor_mclk1_active &cam_sensor_iris_active>;
+		pinctrl-1 = <&cam_sensor_mclk1_suspend &cam_sensor_iris_suspend>;
+		gpios = <&msm_gpio 14 0>,
+			<&msm_gpio 102 0>;
+		qcom,gpio-reset = <1>;
+		qcom,gpio-req-tbl-num = <0 1>;
+		qcom,gpio-req-tbl-flags = <1 0>;
+		qcom,gpio-req-tbl-label = "CAMIF_MCLK1",
+					  "IRIS_CAM_RES_N";
+		qcom,sensor-position = <2>;
+		qcom,sensor-mode = <0>;
+		qcom,cci-master = <0>;
+		status = "disabled";
+		clocks = <&clock_mmss clk_mclk1_clk_src>,
+			<&clock_mmss clk_camss_mclk1_clk>;
+		clock-names = "cam_src_clk", "cam_clk";
+	};
+};
+
+/*
+ * CAF msm8992-camera.dtsi rotates clock-names vs the clocks phandles:
+ * index 2 is clk_csiN_clk_src but is named "csi_clk", and "csi_src_clk"
+ * is the AHB clock. msm_csid_config then clk_set_rate() on AHB → EINVAL.
+ * Restate names so they match the phandles. Talkman CSI0 is 4-lane
+ * lane-assign 0x4320 lane-mask 0x1F.
+ */
+&soc {
+	qcom,csid@fda08000 {
+		clock-names = "camss_top_ahb_clk",
+			"ispif_ahb_clk", "csi_src_clk", "csi_clk",
+			"csi_ahb_clk", "csi_rdi_clk",
+			"csi_pix_clk", "camss_ahb_clk";
+		/* Board lane order for the rear IMX230, see camera@0. */
+		qcom,csi-lane-assign = <0x0423>;
+	};
+	qcom,csid@fda08400 {
+		clock-names = "camss_top_ahb_clk",
+			"ispif_ahb_clk", "csi_src_clk", "csi_clk",
+			"csi_ahb_clk", "csi_rdi_clk",
+			"csi_pix_clk", "camss_ahb_clk";
+	};
+	qcom,csid@fda08800 {
+		clock-names = "camss_top_ahb_clk",
+			"ispif_ahb_clk", "csi_src_clk", "csi_clk",
+			"csi_ahb_clk", "csi_rdi_clk",
+			"csi_pix_clk", "camss_ahb_clk";
+	};
+	qcom,csid@fda08c00 {
+		clock-names = "camss_top_ahb_clk",
+			"ispif_ahb_clk", "csi_src_clk", "csi_clk",
+			"csi_ahb_clk", "csi_rdi_clk",
+			"csi_pix_clk", "camss_ahb_clk";
+	};
+};

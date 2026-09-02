@@ -28,6 +28,8 @@ config MSM_CCI
           bus. It is also responsible for synchronization with
           GPIO and data frames.
 
+source "drivers/media/platform/msm/camera_v2/sensor/Kconfig"
+
 config MSM_CSI20_HEADER
         bool "Qualcomm MSM CSI 2.0 Header"
         depends on MSMB_CAMERA
