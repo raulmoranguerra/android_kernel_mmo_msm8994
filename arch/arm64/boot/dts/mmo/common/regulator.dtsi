@@ -296,7 +296,7 @@
 		pm8994_l25: regulator-l25 {
 			regulator-min-microvolt = <1150000>;
 			regulator-max-microvolt = <1150000>;
-			qcom,init-voltage = <1000000>;
+			qcom,init-voltage = <1150000>;
 			regulator-always-on;
 			status = "okay";
 		};
@@ -409,4 +409,13 @@
 		enable-active-high;
 		gpio = <&pm8994_gpios 9 0>;
 	};
+};
+
+/* Shared camera / sensor 1.8 V VIO (schematic VREG_LVS1A_1P8). Hold on.
+ * Do not sequence this rail as cam_vio in talkman-camera.dtsi.
+ */
+&pm8994_lvs1 {
+	regulator-always-on;
+	regulator-boot-on;
+	status = "okay";
 };

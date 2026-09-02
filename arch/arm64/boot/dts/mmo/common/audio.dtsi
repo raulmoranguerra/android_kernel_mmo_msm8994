@@ -74,6 +74,7 @@
 		reg = <0x40>;
 
 		ti,enable-gpio = <&pm8994_gpios 12 0>;
+		ti,pga-gain = <0x12>;			/* 11 dB; PMIC brownout above this */
 
 		/*
 		 * PGA 0x16 = 15 dB, the chip default (SLAS978B 7.5.20,

@@ -8,7 +8,7 @@
     leds {
         compatible = "gpio-leds";
         flashlight {
-            label = "led::flash_torch";
+            label = "led:flash_torch";
             gpios = <&msm_gpio 12 0>;
             default-state = "off";
             linux,default-trigger = "none";
