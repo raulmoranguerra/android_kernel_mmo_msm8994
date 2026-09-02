@@ -550,6 +550,30 @@ static ssize_t i2c_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	cmd[count] = '\0';
 
+	/* "recover <master>": clock a stuck slave off the bus via TLMM.
+	 * CCI0 is GPIO 17/18, CCI1 (rear IMX230 + BU24210) is GPIO 19/20.
+	 * Only while no power is held, so the CCI block is released. */
+	if (sscanf(cmd, "recover %u", &master) == 1) {
+		int lvl;
+
+		if (master > 1)
+			return -EINVAL;
+		mutex_lock(&s->lock);
+		s->buf_len = 0;
+		s->buf[0] = '\0';
+		if (s->held) {
+			scan_append(s, "recover: echo off > power first\n");
+			mutex_unlock(&s->lock);
+			return -EBUSY;
+		}
+		lvl = msm_cam_talkman_i2c_bus_recover(master ? 19 : 17,
+						      master ? 20 : 18);
+		scan_append(s, "recover m%u: SDA after=%d (1 = released)\n",
+			    master, lvl);
+		mutex_unlock(&s->lock);
+		return lvl < 0 ? lvl : count;
+	}
+
 	if (sscanf(cmd, "%c", &op) != 1)
 		return -EINVAL;
 	if (op == 'r') {

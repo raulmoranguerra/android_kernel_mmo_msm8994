@@ -219,6 +219,100 @@ void msm_cam_dump_mclk0_pad(const char *why, int fix)
 }
 EXPORT_SYMBOL(msm_cam_dump_mclk0_pad);
 
+/*
+ * I2C bus recovery for a CCI master whose slave holds SDA low (seen on
+ * talkman 2026-09-02: a firmware-less BU24210 at 0x7c wedged CCI1 after a
+ * read of 0x00F8; every later transaction, including the IMX230 probe,
+ * hit CCI_TIMEOUT until the phone was powered off). The CCI block has no
+ * recovery path, so drive the pads directly through TLMM: switch both
+ * pins to GPIO, clock SCL 9 times with SDA released, emit a STOP, restore
+ * the original pad configuration. Returns SDA level after recovery
+ * (1 = released) or -errno.
+ */
+#define TALKMAN_GP_CFG(n)	(0x1000 + 0x10 * (n))
+#define TALKMAN_GP_IN_BIT	0
+#define TALKMAN_GP_OUT_BIT	1
+
+static void talkman_pad_drive_low(u32 gpio, bool low)
+{
+	u32 cfg = readl_relaxed(talkman_tlmm + TALKMAN_GP_CFG(gpio));
+
+	/* open-drain emulation: output-low, or input (external pull-up) */
+	if (low) {
+		writel_relaxed(0, talkman_tlmm + TALKMAN_GP_CFG(gpio) + 4);
+		cfg |= BIT(TALKMAN_GP_OE_BIT);
+	} else {
+		cfg &= ~BIT(TALKMAN_GP_OE_BIT);
+	}
+	writel_relaxed(cfg, talkman_tlmm + TALKMAN_GP_CFG(gpio));
+	wmb();
+}
+
+static int talkman_pad_in(u32 gpio)
+{
+	return (readl_relaxed(talkman_tlmm + TALKMAN_GP_CFG(gpio) + 4)
+		>> TALKMAN_GP_IN_BIT) & 1;
+}
+
+int msm_cam_talkman_i2c_bus_recover(u32 sda_gpio, u32 scl_gpio)
+{
+	u32 sda_cfg, scl_cfg, gpio_cfg;
+	int sda_before, scl_before, sda_after, i;
+
+	if (!talkman_tlmm)
+		talkman_tlmm = ioremap(TALKMAN_TLMM_PHYS, TALKMAN_TLMM_SIZE);
+	if (!talkman_tlmm)
+		return -ENOMEM;
+	if (sda_gpio > 145 || scl_gpio > 145)
+		return -EINVAL;
+
+	sda_cfg = readl_relaxed(talkman_tlmm + TALKMAN_GP_CFG(sda_gpio));
+	scl_cfg = readl_relaxed(talkman_tlmm + TALKMAN_GP_CFG(scl_gpio));
+
+	/* GPIO function, keep pull/drive bits, start as inputs */
+	gpio_cfg = sda_cfg & ~(TALKMAN_GP_FUNC_MASK << TALKMAN_GP_FUNC_SHFT);
+	gpio_cfg &= ~BIT(TALKMAN_GP_OE_BIT);
+	writel_relaxed(gpio_cfg, talkman_tlmm + TALKMAN_GP_CFG(sda_gpio));
+	gpio_cfg = scl_cfg & ~(TALKMAN_GP_FUNC_MASK << TALKMAN_GP_FUNC_SHFT);
+	gpio_cfg &= ~BIT(TALKMAN_GP_OE_BIT);
+	writel_relaxed(gpio_cfg, talkman_tlmm + TALKMAN_GP_CFG(scl_gpio));
+	wmb();
+	udelay(5);
+	sda_before = talkman_pad_in(sda_gpio);
+	scl_before = talkman_pad_in(scl_gpio);
+
+	/* 9 clocks at ~100 kHz with SDA released; a stuck slave finishes
+	 * its byte and releases SDA on the ACK clock. */
+	for (i = 0; i < 9; i++) {
+		talkman_pad_drive_low(scl_gpio, true);
+		udelay(5);
+		talkman_pad_drive_low(scl_gpio, false);
+		udelay(5);
+		if (talkman_pad_in(sda_gpio))
+			break;
+	}
+	/* STOP: SDA low while SCL low, SCL high, then SDA high */
+	talkman_pad_drive_low(scl_gpio, true);
+	udelay(5);
+	talkman_pad_drive_low(sda_gpio, true);
+	udelay(5);
+	talkman_pad_drive_low(scl_gpio, false);
+	udelay(5);
+	talkman_pad_drive_low(sda_gpio, false);
+	udelay(5);
+	sda_after = talkman_pad_in(sda_gpio);
+
+	writel_relaxed(sda_cfg, talkman_tlmm + TALKMAN_GP_CFG(sda_gpio));
+	writel_relaxed(scl_cfg, talkman_tlmm + TALKMAN_GP_CFG(scl_gpio));
+	wmb();
+
+	pr_info("%s: SDA%u/SCL%u before=%d/%d clocks=%d after SDA=%d cfg restored 0x%x/0x%x\n",
+		__func__, sda_gpio, scl_gpio, sda_before, scl_before, i + 1,
+		sda_after, sda_cfg, scl_cfg);
+	return sda_after;
+}
+EXPORT_SYMBOL(msm_cam_talkman_i2c_bus_recover);
+
 void msm_camera_io_w(u32 data, void __iomem *addr)
 {
 	CDBG("%s: 0x%pK %08x\n", __func__,  (addr), (data));
