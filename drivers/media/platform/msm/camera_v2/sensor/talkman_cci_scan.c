@@ -22,6 +22,7 @@
 #include <linux/of.h>
 #include <linux/of_gpio.h>
 #include <linux/gpio.h>
+#include <linux/firmware.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
@@ -607,6 +608,289 @@ static const struct file_operations i2c_fops = {
 	.llseek = default_llseek,
 };
 
+/* ---- BU24210 OIS/AF companion (CCI1 write 0x7c) lab commands --------
+ *
+ * Register sequence is the Rohm BU242xx family flow from the GPL LG
+ * drivers (lgit_ois_rohm.c BU24205, lgit_imx258_claf_rohm_ois.c BU24235):
+ *   0xF010 <- 0x00           start download
+ *   0x0000..                 program RAM (burst)
+ *   0xF008 (32 bit)          checksum of the download
+ *   0xF006 <- 0x00           download complete
+ *   0x6024 == 0x01           ready poll
+ *   0x6020 <- 0x01           servo on / lens centering
+ *   0x60D6 <- 0x01           VCM (AF) init
+ *   0x60DA <- u16            AF target
+ *   0x609E <- 0x01           standby
+ * The .kar in /vendor/firmware is the WOA DCC blob: 22-byte DTI wrapper
+ * (type 0x02, u16le total, pad, "7C 10 81 05 84 05 01 00", 8 zero bytes,
+ * u16le fw_size) then the Cortex-M0 image. Everything is verified on the
+ * device through the checksum and the status register; nothing here is
+ * bound to the HAL.
+ */
+#define BU24210_SID		0x3e
+#define BU24210_MASTER		MASTER_1
+#define BU24210_KAR_HDR		22
+#define BU24210_REG_START_DL	0xF010
+#define BU24210_REG_CHECKSUM	0xF008
+#define BU24210_REG_COMPLETE_DL	0xF006
+#define BU24210_REG_STATUS	0x6024
+#define BU24210_REG_CTRL	0x6020
+#define BU24210_REG_VCM_INIT	0x60D6
+#define BU24210_REG_VCM_TARGET	0x60DA
+#define BU24210_REG_STANDBY	0x609E
+#define BU24210_DL_CHUNK	32
+
+static struct msm_camera_i2c_client *ois_client(struct talkman_cci_scan *s)
+{
+	if (s->held != 1 || !s->held_client.cci_client)
+		return NULL;
+	s->held_cci->cci_i2c_master = BU24210_MASTER;
+	s->held_cci->sid = BU24210_SID;
+	s->held_client.addr_type = MSM_CAMERA_I2C_WORD_ADDR;
+	return &s->held_client;
+}
+
+static int ois_w8(struct msm_camera_i2c_client *c, u16 reg, u8 val)
+{
+	return msm_camera_cci_i2c_write(c, reg, val, MSM_CAMERA_I2C_BYTE_DATA);
+}
+
+static int ois_r8(struct msm_camera_i2c_client *c, u16 reg, u8 *val)
+{
+	uint16_t d = 0;
+	int rc = msm_camera_cci_i2c_read(c, reg, &d, MSM_CAMERA_I2C_BYTE_DATA);
+
+	*val = d & 0xff;
+	return rc;
+}
+
+/* LG poll_ready: 1 ms, then up to @limit reads of 0x6024 5 ms apart. */
+static int ois_poll_ready(struct talkman_cci_scan *s,
+			  struct msm_camera_i2c_client *c, int limit,
+			  const char *what)
+{
+	u8 st = 0;
+	int i, rc = 0;
+
+	usleep_range(1000, 1100);
+	for (i = 0; i < limit; i++) {
+		rc = ois_r8(c, BU24210_REG_STATUS, &st);
+		if (rc)
+			break;
+		if (st == 0x01)
+			break;
+		usleep_range(5000, 5100);
+	}
+	pr_info("%s: ois %s: 0x6024=0x%02x after %d reads rc=%d\n",
+		DRV_NAME, what, st, i + 1, rc);
+	scan_append(s, "%s: 0x6024=0x%02x reads=%d rc=%d\n",
+		    what, st, i + 1, rc);
+	if (rc)
+		return rc;
+	return st == 0x01 ? 0 : -ETIMEDOUT;
+}
+
+static int ois_download(struct talkman_cci_scan *s, const char *name)
+{
+	struct msm_camera_i2c_client *c = ois_client(s);
+	const struct firmware *fw;
+	const u8 *fw_data;
+	u32 fw_size, total, sum = 0, off, chk_be, chk_le;
+	u8 chk[4] = {0, 0, 0, 0}, st = 0;
+	int rc;
+
+	if (!c) {
+		scan_append(s, "ois: echo rear > power first\n");
+		return -ENXIO;
+	}
+	rc = request_firmware(&fw, name, s->dev);
+	if (rc) {
+		scan_append(s, "ois: request_firmware(%s) rc=%d\n", name, rc);
+		return rc;
+	}
+	if (fw->size < BU24210_KAR_HDR + 16 || fw->data[0] != 0x02) {
+		scan_append(s, "ois: %s is not a DTI .kar (size %zu, type 0x%02x)\n",
+			    name, fw->size, fw->data[0]);
+		rc = -EINVAL;
+		goto out;
+	}
+	total = fw->data[1] | (fw->data[2] << 8);
+	fw_size = fw->data[20] | (fw->data[21] << 8);
+	if (total != fw->size || fw_size + BU24210_KAR_HDR != total) {
+		scan_append(s, "ois: %s header total=%u fw=%u file=%zu mismatch\n",
+			    name, total, fw_size, fw->size);
+		rc = -EINVAL;
+		goto out;
+	}
+	fw_data = fw->data + BU24210_KAR_HDR;
+	for (off = 0; off < fw_size; off++)
+		sum += fw_data[off];
+	scan_append(s, "ois: %s fw=%u bytes wrapper=%02x%02x %02x%02x %02x%02x %02x byte-sum=0x%08x\n",
+		    name, fw_size, fw->data[4], fw->data[5], fw->data[6],
+		    fw->data[7], fw->data[8], fw->data[9], fw->data[10], sum);
+
+	ois_r8(c, BU24210_REG_STATUS, &st);
+	scan_append(s, "ois: pre 0x6024=0x%02x\n", st);
+
+	rc = ois_w8(c, BU24210_REG_START_DL, 0x00);
+	if (rc) {
+		scan_append(s, "ois: F010 start rc=%d\n", rc);
+		goto out;
+	}
+	for (off = 0; off < fw_size; off += BU24210_DL_CHUNK) {
+		u32 n = min_t(u32, BU24210_DL_CHUNK, fw_size - off);
+
+		rc = msm_camera_cci_i2c_write_seq(c, off, (u8 *)fw_data + off,
+						  n);
+		if (rc) {
+			scan_append(s, "ois: burst at 0x%04x (%u B) rc=%d\n",
+				    off, n, rc);
+			goto out;
+		}
+	}
+	scan_append(s, "ois: %u bytes written to 0x0000..0x%04x\n",
+		    fw_size, fw_size - 1);
+
+	rc = msm_camera_cci_i2c_read_seq(c, BU24210_REG_CHECKSUM, chk, 4);
+	chk_be = (chk[0] << 24) | (chk[1] << 16) | (chk[2] << 8) | chk[3];
+	chk_le = (chk[3] << 24) | (chk[2] << 16) | (chk[1] << 8) | chk[0];
+	pr_info("%s: ois F008=%02x %02x %02x %02x (be 0x%08x le 0x%08x) sum 0x%08x rc=%d\n",
+		DRV_NAME, chk[0], chk[1], chk[2], chk[3], chk_be, chk_le, sum, rc);
+	scan_append(s, "ois: F008=%02x %02x %02x %02x be=0x%08x le=0x%08x %s rc=%d\n",
+		    chk[0], chk[1], chk[2], chk[3], chk_be, chk_le,
+		    (chk_be == sum || chk_le == sum) ? "MATCH" : "no-match",
+		    rc);
+
+	rc = ois_w8(c, BU24210_REG_COMPLETE_DL, 0x00);
+	if (rc) {
+		scan_append(s, "ois: F006 complete rc=%d\n", rc);
+		goto out;
+	}
+	rc = ois_poll_ready(s, c, 15, "post-download");
+out:
+	release_firmware(fw);
+	return rc;
+}
+
+static int ois_servo(struct talkman_cci_scan *s)
+{
+	struct msm_camera_i2c_client *c = ois_client(s);
+	u8 v = 0;
+	int rc;
+
+	if (!c)
+		return -ENXIO;
+	ois_r8(c, BU24210_REG_CTRL, &v);
+	scan_append(s, "ois: pre 0x6020=0x%02x\n", v);
+	rc = ois_w8(c, BU24210_REG_CTRL, 0x01);
+	if (rc)
+		return rc;
+	rc = ois_poll_ready(s, c, 20, "servo-on");
+	if (rc)
+		return rc;
+	rc = ois_w8(c, BU24210_REG_VCM_INIT, 0x01);
+	scan_append(s, "ois: 60D6 vcm-init rc=%d\n", rc);
+	if (rc)
+		return rc;
+	return ois_poll_ready(s, c, 15, "vcm-init");
+}
+
+static int ois_af(struct talkman_cci_scan *s, unsigned int target)
+{
+	struct msm_camera_i2c_client *c = ois_client(s);
+	int rc;
+
+	if (!c)
+		return -ENXIO;
+	if (target > 1023)
+		return -EINVAL;
+	rc = msm_camera_cci_i2c_write(c, BU24210_REG_VCM_TARGET, target,
+				      MSM_CAMERA_I2C_WORD_DATA);
+	pr_info("%s: ois af 60DA <- %u rc=%d\n", DRV_NAME, target, rc);
+	scan_append(s, "ois: 60DA <- %u rc=%d\n", target, rc);
+	return rc;
+}
+
+static int ois_standby(struct talkman_cci_scan *s)
+{
+	struct msm_camera_i2c_client *c = ois_client(s);
+	int rc;
+
+	if (!c)
+		return -ENXIO;
+	rc = ois_w8(c, BU24210_REG_CTRL, 0x01);
+	ois_poll_ready(s, c, 15, "centering");
+	rc = ois_w8(c, BU24210_REG_STANDBY, 0x01);
+	scan_append(s, "ois: 609E standby rc=%d\n", rc);
+	return rc;
+}
+
+static int ois_dump(struct talkman_cci_scan *s, unsigned int reg,
+		    unsigned int n)
+{
+	struct msm_camera_i2c_client *c = ois_client(s);
+	u8 buf[16];
+	int rc;
+	unsigned int i;
+
+	if (!c)
+		return -ENXIO;
+	if (!n || n > sizeof(buf))
+		return -EINVAL;
+	rc = msm_camera_cci_i2c_read_seq(c, reg, buf, n);
+	scan_append(s, "ois: 0x%04x:", reg);
+	for (i = 0; i < n; i++)
+		scan_append(s, " %02x", buf[i]);
+	scan_append(s, " rc=%d\n", rc);
+	return rc;
+}
+
+/*
+ * ois: "dl <kar>" | "servo" | "af <0..1023>" | "standby" | "rd <reg> [n]"
+ * Rear power must be held. Snap must be closed.
+ */
+static ssize_t ois_write(struct file *file, const char __user *ubuf,
+			 size_t count, loff_t *ppos)
+{
+	struct talkman_cci_scan *s = file->private_data;
+	char cmd[128], name[96];
+	unsigned int a = 0, b = 1;
+	int rc;
+
+	if (count >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, ubuf, count))
+		return -EFAULT;
+	cmd[count] = '\0';
+	strim(cmd);
+
+	mutex_lock(&s->lock);
+	s->buf_len = 0;
+	s->buf[0] = '\0';
+	if (sscanf(cmd, "dl %95s", name) == 1)
+		rc = ois_download(s, name);
+	else if (!strcmp(cmd, "servo"))
+		rc = ois_servo(s);
+	else if (sscanf(cmd, "af %u", &a) == 1)
+		rc = ois_af(s, a);
+	else if (!strcmp(cmd, "standby"))
+		rc = ois_standby(s);
+	else if (sscanf(cmd, "rd %i %u", &a, &b) >= 1)
+		rc = ois_dump(s, a, b);
+	else
+		rc = -EINVAL;
+	mutex_unlock(&s->lock);
+	return rc ? rc : count;
+}
+
+static const struct file_operations ois_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = scan_read,
+	.write = ois_write,
+	.llseek = default_llseek,
+};
+
 static void talkman_cci_scan_own(struct dentry *d, umode_t mode)
 {
 	struct inode *inode;
@@ -689,6 +973,8 @@ static int talkman_cci_scan_probe(struct platform_device *pdev)
 		d = debugfs_create_file("power", 0660, s->dbg, s, &power_fops);
 		talkman_cci_scan_own(d, 0660);
 		d = debugfs_create_file("i2c", 0660, s->dbg, s, &i2c_fops);
+		talkman_cci_scan_own(d, 0660);
+		d = debugfs_create_file("ois", 0660, s->dbg, s, &ois_fops);
 		talkman_cci_scan_own(d, 0660);
 	}
 
