@@ -67,4 +67,7 @@ int msm_camera_config_single_vreg(struct device *dev,
 int msm_camera_request_gpio_table(struct gpio *gpio_tbl, uint8_t size,
 	int gpio_en);
 
+/* Talkman: MMSS MCLK0 RCG/CBCR + GPIO13 TLMM. fix re-latches 24 MHz. */
+void msm_cam_dump_mclk0_pad(const char *why, int fix);
+
 #endif

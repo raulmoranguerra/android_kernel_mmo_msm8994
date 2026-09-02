@@ -1,0 +1,14 @@
+# Talkman (Lumia 950) CCI slave scanner.
+# Built-in only: msm_camera_cci_i2c_* is not exported.
+
+config TALKMAN_CCI_SCAN
+	bool "Talkman CCI slave / SMIA model_id scanner"
+	depends on MSMB_CAMERA && MSM_CCI && DEBUG_FS
+	default y
+	---help---
+	  Power talkman camera rails (LDO23/25/29, LDO17, LVS1) and
+	  mclk0/mclk2 at 9.6 MHz, then scan CCI 7-bit addresses and
+	  read SMIA 0x0000 and Sony 0x0016. Slave addresses are not in
+	  WOA ACPI or SMIApp. Compatible "mmo,talkman-cci-scan".
+	  echo 1 > /sys/kernel/debug/talkman-cci-scan/scan
+	  Do not invent 7-bit addresses; run the scan on hardware.

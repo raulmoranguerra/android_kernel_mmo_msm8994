@@ -15,6 +15,9 @@
 #include "msm_isp_util.h"
 #include "msm_isp_axi_util.h"
 
+void msm_csid_dump_all(const char *why);
+void msm_csiphy_dump_all(const char *why);
+
 #define SRC_TO_INTF(src) \
 	((src < RDI_INTF_0 || src == VFE_AXI_SRC_MAX) ? VFE_PIX_0 : \
 	(VFE_RAW_0 + src - RDI_INTF_0))
@@ -1736,6 +1739,8 @@ static int msm_isp_axi_wait_for_cfg_done(struct vfe_device *vfe_dev,
 			}
 		}
 		pr_err("%s: wait timeout\n", __func__);
+		msm_csid_dump_all("axi_wait_timeout");
+		msm_csiphy_dump_all("axi_wait_timeout");
 		rc = -EBUSY;
 	} else {
 		rc = 0;

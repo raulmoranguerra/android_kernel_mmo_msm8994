@@ -16,14 +16,208 @@
 #include <linux/regulator/consumer.h>
 #include <linux/io.h>
 #include <linux/err.h>
+#include <linux/export.h>
+#include <linux/string.h>
+#include <linux/bitops.h>
+#include <asm/div64.h>
 #include <soc/qcom/camera2.h>
 #include <linux/msm-bus.h>
 #include "msm_camera_io_util.h"
 
 #define BUFF_SIZE_128 128
 
+/* MSM8992 MMSS + TLMM. GPIO 13 is CAM_MCLK0, not XSHUTDN. */
+#define TALKMAN_MMSS_PHYS		0xfd8c0000
+#define TALKMAN_MMSS_SIZE		0x5200
+#define TALKMAN_TLMM_PHYS		0xfd510000
+#define TALKMAN_TLMM_SIZE		0x4000
+#define TALKMAN_MMPLL4_MODE		0x0090
+#define TALKMAN_MCLK0_CMD_RCGR		0x3360
+#define TALKMAN_MCLK0_CFG_RCGR		0x3364
+#define TALKMAN_MCLK0_M			0x3368
+#define TALKMAN_MCLK0_N			0x336c
+#define TALKMAN_MCLK0_D			0x3370
+#define TALKMAN_CAMSS_MCLK0_CBCR	0x3384
+/* CAF F_MM(24000000, mmpll4_out_main, 10, 1, 4): 960 MHz / 10 * M/N 1/4.
+ * CFG MODE is bits [13:12]==2 (dual-edge), not bit 12. 0x2313 with MND
+ * bypassed is 96 MHz (HID only) - that is the #26 dump lie. */
+#define TALKMAN_MCLK0_CFG_24MHZ		0x2313
+#define TALKMAN_MCLK0_M_24MHZ		0x1
+#define TALKMAN_MCLK0_N_24MHZ		0xfc	/* ~(4 - 1) */
+#define TALKMAN_MCLK0_D_24MHZ		0xfb	/* ~(4) */
+#define TALKMAN_MND_DUAL_EDGE		0x2
+#define TALKMAN_GPIO13			13
+#define TALKMAN_GPIO13_CFG		(0x1000 + 0x10 * TALKMAN_GPIO13)
+#define TALKMAN_GPIO13_INOUT		(TALKMAN_GPIO13_CFG + 4)
+#define TALKMAN_GP_FUNC_SHFT		2
+#define TALKMAN_GP_FUNC_MASK		0xf
+#define TALKMAN_GP_DRV_SHFT		6
+#define TALKMAN_GP_PULL_MASK		0x3
+#define TALKMAN_GP_OE_BIT		9
+#define TALKMAN_CAM_MCLK_FUNC		1
+
 #undef CDBG
 #define CDBG(fmt, args...) pr_debug(fmt, ##args)
+
+static void __iomem *talkman_mmss;
+static void __iomem *talkman_tlmm;
+
+static u32 talkman_mclk0_parent_hz(u32 src_sel)
+{
+	switch (src_sel) {
+	case 0:
+		return 19200000; /* XO */
+	case 3:
+		return 960000000; /* MMPLL4 out_main (MCLK tables) */
+	case 5:
+		return 600000000; /* GPLL0 */
+	default:
+		return 0;
+	}
+}
+
+static void talkman_mclk0_read(u32 *cmd, u32 *cfg, u32 *mreg, u32 *nreg,
+	u32 *dreg, u32 *cbcr, u32 *pll)
+{
+	*pll = readl_relaxed(talkman_mmss + TALKMAN_MMPLL4_MODE);
+	*cmd = readl_relaxed(talkman_mmss + TALKMAN_MCLK0_CMD_RCGR);
+	*cfg = readl_relaxed(talkman_mmss + TALKMAN_MCLK0_CFG_RCGR);
+	*mreg = readl_relaxed(talkman_mmss + TALKMAN_MCLK0_M);
+	*nreg = readl_relaxed(talkman_mmss + TALKMAN_MCLK0_N);
+	*dreg = readl_relaxed(talkman_mmss + TALKMAN_MCLK0_D);
+	*cbcr = readl_relaxed(talkman_mmss + TALKMAN_CAMSS_MCLK0_CBCR);
+}
+
+static u64 talkman_mclk0_hz(u32 cmd, u32 cfg, u32 mreg, u32 nreg, u32 cbcr,
+	u32 *src_sel, u32 *hid, u32 *mnd, u32 *m, u32 *n)
+{
+	u32 src_div, parent, mnd_on;
+	u64 hz;
+
+	src_div = cfg & 0x1f;
+	*hid = (src_div + 1) / 2;
+	if (!*hid)
+		*hid = 1;
+	*src_sel = (cfg >> 8) & 0x7;
+	*mnd = (cfg >> 12) & 0x3;
+	*m = mreg & 0xff;
+	*n = ((~nreg) & 0xff) + *m;
+	mnd_on = (*mnd == TALKMAN_MND_DUAL_EDGE);
+	parent = talkman_mclk0_parent_hz(*src_sel);
+	hz = parent;
+	if (mnd_on && *m && *n) {
+		hz *= *m;
+		do_div(hz, *n);
+	}
+	do_div(hz, *hid);
+	if ((cmd & BIT(31)) || (cbcr & BIT(31)))
+		hz = 0;
+	return hz;
+}
+
+/* Re-program MMPLL4 / 10 * 1/4 and pulse CMD UPDATE. clk_set_rate can
+ * write this while ROOT_OFF; MND counters need a second update after
+ * camss_mclk0 CBCR enables the root. */
+static void talkman_mclk0_force_24mhz(const char *why)
+{
+	u32 cmd, i;
+
+	writel_relaxed(TALKMAN_MCLK0_M_24MHZ, talkman_mmss + TALKMAN_MCLK0_M);
+	writel_relaxed(TALKMAN_MCLK0_N_24MHZ, talkman_mmss + TALKMAN_MCLK0_N);
+	writel_relaxed(TALKMAN_MCLK0_D_24MHZ, talkman_mmss + TALKMAN_MCLK0_D);
+	writel_relaxed(TALKMAN_MCLK0_CFG_24MHZ,
+		talkman_mmss + TALKMAN_MCLK0_CFG_RCGR);
+	wmb();
+	cmd = readl_relaxed(talkman_mmss + TALKMAN_MCLK0_CMD_RCGR);
+	cmd |= BIT(0);
+	writel_relaxed(cmd, talkman_mmss + TALKMAN_MCLK0_CMD_RCGR);
+	wmb();
+	for (i = 0; i < 500; i++) {
+		if (!(readl_relaxed(talkman_mmss + TALKMAN_MCLK0_CMD_RCGR)
+		      & BIT(0)))
+			break;
+		udelay(1);
+	}
+	pr_info("%s: %s forced 24MHz RCG cfg=0x%x M=0x%x N=0x%x D=0x%x update_loops=%u (MMPLL4/10 MND 1/4, not HID-only 96e6)\n",
+		__func__, why ? why : "?", TALKMAN_MCLK0_CFG_24MHZ,
+		TALKMAN_MCLK0_M_24MHZ, TALKMAN_MCLK0_N_24MHZ,
+		TALKMAN_MCLK0_D_24MHZ, i);
+}
+
+void msm_cam_dump_mclk0_pad(const char *why, int fix)
+{
+	u32 cmd, cfg, mreg, nreg, dreg, cbcr, pll, gcfg, gin;
+	u32 hid, src_sel, mnd, m, n, oe, func, pull, drv;
+	u32 i, samples, stuck;
+	u64 hz;
+	static const char *pull_nm[] = { "np", "pd", "kz", "pu" };
+
+	if (!talkman_mmss)
+		talkman_mmss = ioremap(TALKMAN_MMSS_PHYS, TALKMAN_MMSS_SIZE);
+	if (!talkman_tlmm)
+		talkman_tlmm = ioremap(TALKMAN_TLMM_PHYS, TALKMAN_TLMM_SIZE);
+	if (!talkman_mmss || !talkman_tlmm) {
+		pr_err("%s: %s ioremap mmss=%pK tlmm=%pK failed\n",
+			__func__, why ? why : "?", talkman_mmss, talkman_tlmm);
+		return;
+	}
+
+	talkman_mclk0_read(&cmd, &cfg, &mreg, &nreg, &dreg, &cbcr, &pll);
+	gcfg = readl_relaxed(talkman_tlmm + TALKMAN_GPIO13_CFG);
+	gin = readl_relaxed(talkman_tlmm + TALKMAN_GPIO13_INOUT);
+
+	func = (gcfg >> TALKMAN_GP_FUNC_SHFT) & TALKMAN_GP_FUNC_MASK;
+	oe = (gcfg >> TALKMAN_GP_OE_BIT) & 1;
+	pull = gcfg & TALKMAN_GP_PULL_MASK;
+	drv = ((gcfg >> TALKMAN_GP_DRV_SHFT) & 0x7) + 1;
+	drv <<= 1;
+
+	if (fix && (func != TALKMAN_CAM_MCLK_FUNC || !oe)) {
+		u32 ncfg = gcfg;
+
+		ncfg &= ~(TALKMAN_GP_FUNC_MASK << TALKMAN_GP_FUNC_SHFT);
+		ncfg |= (TALKMAN_CAM_MCLK_FUNC << TALKMAN_GP_FUNC_SHFT);
+		ncfg |= BIT(TALKMAN_GP_OE_BIT);
+		writel_relaxed(ncfg, talkman_tlmm + TALKMAN_GPIO13_CFG);
+		wmb();
+		gcfg = readl_relaxed(talkman_tlmm + TALKMAN_GPIO13_CFG);
+		func = (gcfg >> TALKMAN_GP_FUNC_SHFT) & TALKMAN_GP_FUNC_MASK;
+		oe = (gcfg >> TALKMAN_GP_OE_BIT) & 1;
+		pr_info("%s: %s GPIO13 forced func=%u OE=%u (CAM_MCLK, not XSHUTDN/91/92)\n",
+			__func__, why ? why : "?", func, oe);
+	}
+
+	if (fix)
+		talkman_mclk0_force_24mhz(why);
+
+	talkman_mclk0_read(&cmd, &cfg, &mreg, &nreg, &dreg, &cbcr, &pll);
+	gcfg = readl_relaxed(talkman_tlmm + TALKMAN_GPIO13_CFG);
+	gin = readl_relaxed(talkman_tlmm + TALKMAN_GPIO13_INOUT);
+	func = (gcfg >> TALKMAN_GP_FUNC_SHFT) & TALKMAN_GP_FUNC_MASK;
+	oe = (gcfg >> TALKMAN_GP_OE_BIT) & 1;
+	pull = gcfg & TALKMAN_GP_PULL_MASK;
+	drv = ((gcfg >> TALKMAN_GP_DRV_SHFT) & 0x7) + 1;
+	drv <<= 1;
+	hz = talkman_mclk0_hz(cmd, cfg, mreg, nreg, cbcr,
+		&src_sel, &hid, &mnd, &m, &n);
+
+	samples = 0;
+	for (i = 0; i < 16; i++)
+		samples |= (readl_relaxed(talkman_tlmm + TALKMAN_GPIO13_INOUT)
+			    & BIT(0)) << i;
+	stuck = (samples == 0 || samples == 0xffff);
+
+	pr_info("%s: %s MCLK0 hw_hz=%llu cmd=0x%x cfg=0x%x M=0x%x N=0x%x D=0x%x cbcr=0x%x pll4=0x%x src=%u hid=%u mnd=%u m=%u n=%u ROOT_OFF=%u CLK_OFF=%u CLK_EN=%u\n",
+		__func__, why ? why : "?", (unsigned long long)hz, cmd, cfg, mreg, nreg, dreg, cbcr,
+		pll, src_sel, hid, mnd, m, (mnd == TALKMAN_MND_DUAL_EDGE) ? n : 0,
+		!!(cmd & BIT(31)), !!(cbcr & BIT(31)), cbcr & 1);
+	pr_info("%s: %s GPIO13 cfg=0x%x inout=0x%x func=%u %s OE=%u pull=%s drv=%umA in_samples=0x%04x %s (MCLK0, not XSHUTDN)\n",
+		__func__, why ? why : "?", gcfg, gin, func,
+		func == TALKMAN_CAM_MCLK_FUNC ? "CAM_MCLK" : "GPIO",
+		oe, pull_nm[pull], drv, samples,
+		stuck ? "STUCK" : "toggling");
+}
+EXPORT_SYMBOL(msm_cam_dump_mclk0_pad);
 
 void msm_camera_io_w(u32 data, void __iomem *addr)
 {
@@ -204,6 +398,21 @@ int msm_cam_clk_enable(struct device *dev, struct msm_cam_clk_info *clk_info,
 					   clk_info[i].clk_name);
 				goto cam_clk_enable_err;
 			}
+			if (clk_info[i].clk_rate > 0 ||
+			    (clk_info[i].clk_name &&
+			     (!strcmp(clk_info[i].clk_name, "cam_src_clk") ||
+			      !strcmp(clk_info[i].clk_name, "cam_clk") ||
+			      !strcmp(clk_info[i].clk_name, "csi_src_clk"))))
+				pr_info("%s: %s req=%ld get_rate=%lu\n",
+					__func__, clk_info[i].clk_name,
+					clk_info[i].clk_rate,
+					clk_get_rate(clk_ptr[i]));
+			if (clk_info[i].clk_name &&
+			    !strcmp(clk_info[i].clk_name, "cam_src_clk"))
+				msm_cam_dump_mclk0_pad("cam_src_clk", 1);
+			if (clk_info[i].clk_name &&
+			    !strcmp(clk_info[i].clk_name, "cam_clk"))
+				msm_cam_dump_mclk0_pad("cam_clk", 1);
 			if (clk_info[i].delay > 20) {
 				msleep(clk_info[i].delay);
 			} else if (clk_info[i].delay) {
@@ -553,6 +762,13 @@ int msm_camera_config_single_vreg(struct device *dev,
 				vreg_name);
 			goto vreg_unconfig;
 		}
+		pr_info("%s: %s enable ok volt=%d is_en=%d min=%d max=%d op=%d\n",
+			__func__, vreg_name,
+			regulator_count_voltages(*reg_ptr) > 0 ?
+				regulator_get_voltage(*reg_ptr) : -1,
+			regulator_is_enabled(*reg_ptr),
+			cam_vreg->min_voltage, cam_vreg->max_voltage,
+			cam_vreg->op_mode);
 	} else {
 		CDBG("%s disable %s\n", __func__, vreg_name);
 		if (*reg_ptr) {
@@ -599,8 +815,10 @@ int msm_camera_request_gpio_table(struct gpio *gpio_tbl, uint8_t size,
 		return -EINVAL;
 	}
 	for (i = 0; i < size; i++) {
-		CDBG("%s:%d i %d, gpio %d dir %ld\n", __func__, __LINE__, i,
-			gpio_tbl[i].gpio, gpio_tbl[i].flags);
+		pr_info("%s: %s gpio %d flags=0x%lx %s\n", __func__,
+			gpio_en ? "request" : "free",
+			gpio_tbl[i].gpio, gpio_tbl[i].flags,
+			gpio_tbl[i].label ? gpio_tbl[i].label : "");
 	}
 	if (gpio_en) {
 		for (i = 0; i < size; i++) {
@@ -617,6 +835,7 @@ int msm_camera_request_gpio_table(struct gpio *gpio_tbl, uint8_t size,
 					gpio_tbl[i].gpio, gpio_tbl[i].label);
 			}
 		}
+		msm_cam_dump_mclk0_pad("gpio_request", 0);
 	} else {
 		gpio_free_array(gpio_tbl, size);
 	}
