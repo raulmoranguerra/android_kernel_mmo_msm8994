@@ -140,5 +140,57 @@
 				bias-disable;
 			};
 		};
+
+		/*
+		 * Front CAM_FRONT_RES_N (schematic GPIO 104). Do not claim
+		 * GPIO 105 (MTP standby, not on 4VM_08r).
+		 */
+		cam_sensor_front_rst_active {
+			qcom,pins = <&gp 104>;
+			qcom,num-grp-pins = <1>;
+			label = "cam_sensor_front_rst_active";
+
+			cam_sensor_front_rst_active: cam_sensor_front_rst_active {
+				drive-strength = <2>;
+				bias-disable;
+			};
+		};
+
+		cam_sensor_front_rst_suspend {
+			qcom,pins = <&gp 104>;
+			qcom,num-grp-pins = <1>;
+			label = "cam_sensor_front_rst_suspend";
+
+			cam_sensor_front_rst_suspend: cam_sensor_front_rst_suspend {
+				drive-strength = <2>;
+				bias-disable;
+			};
+		};
+
+		/*
+		 * Iris IRIS_CAM_RES_N (schematic GPIO 102). GPIO 106 is not
+		 * on the drawing. Do not use cam_sensor_rear2 (GPIO 94 = NFC).
+		 */
+		cam_sensor_iris_active {
+			qcom,pins = <&gp 102>;
+			qcom,num-grp-pins = <1>;
+			label = "cam_sensor_iris_active";
+
+			cam_sensor_iris_active: cam_sensor_iris_active {
+				drive-strength = <2>;
+				bias-disable;
+			};
+		};
+
+		cam_sensor_iris_suspend {
+			qcom,pins = <&gp 102>;
+			qcom,num-grp-pins = <1>;
+			label = "cam_sensor_iris_suspend";
+
+			cam_sensor_iris_suspend: cam_sensor_iris_suspend {
+				drive-strength = <2>;
+				bias-disable;
+			};
+		};
 	};
 };
