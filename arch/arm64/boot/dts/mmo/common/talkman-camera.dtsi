@@ -39,11 +39,17 @@
 			<&clock_mmss clk_camss_mclk2_clk>;
 		clock-names = "mclk0_src", "mclk0", "mclk2_src", "mclk2";
 		qcom,mclk-rate = <24000000>;
+		/* Schematic CAM_FRONT_RES_N. Released (high) during the front
+		 * sweep so a sensor held in reset can ACK. camera@1 is
+		 * disabled, so the scanner may own the GPIO. */
+		mmo,front-reset-gpio = <&msm_gpio 104 0>;
 		pinctrl-names = "default", "scan";
 		pinctrl-0 = <&cam_sensor_mclk0_suspend
-			     &cam_sensor_mclk2_suspend>;
+			     &cam_sensor_mclk2_suspend
+			     &cam_sensor_front_rst_suspend>;
 		pinctrl-1 = <&cam_sensor_mclk0_active
-			     &cam_sensor_mclk2_active>;
+			     &cam_sensor_mclk2_active
+			     &cam_sensor_front_rst_active>;
 	};
 };
 
