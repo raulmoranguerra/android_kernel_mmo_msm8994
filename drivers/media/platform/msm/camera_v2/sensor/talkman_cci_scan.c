@@ -20,6 +20,8 @@
 #include <linux/string.h>
 #include <linux/err.h>
 #include <linux/of.h>
+#include <linux/of_gpio.h>
+#include <linux/gpio.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
@@ -52,10 +54,20 @@ struct talkman_cci_scan {
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *pins_default;
 	struct pinctrl_state *pins_scan;
+	int front_rst_gpio;		/* CAM_FRONT_RES_N GPIO 104, -1 if absent */
 	struct dentry *dbg;
 	struct mutex lock;
 	char *buf;
 	size_t buf_len;
+	/*
+	 * "power" debugfs: keep one camera powered with CCI initialised so
+	 * "i2c" can do raw reads/writes (BU24210 @ 0x7c probing, front
+	 * bring-up) without re-powering per transaction.
+	 */
+	int held;			/* 0 off, 1 rear, 2 front */
+	int held_inits;
+	struct msm_camera_cci_client *held_cci;
+	struct msm_camera_i2c_client held_client;
 };
 
 static int scan_append(struct talkman_cci_scan *s, const char *fmt, ...)
@@ -187,6 +199,8 @@ static int scan_power_front(struct talkman_cci_scan *s, bool on)
 	int rc;
 
 	if (!on) {
+		if (gpio_is_valid(s->front_rst_gpio))
+			gpio_set_value(s->front_rst_gpio, 0);
 		scan_clk_off(s->mclk2_src, s->mclk2);
 		scan_power_rail(s->vio, false);
 		scan_power_rail(s->vana_front, false);
@@ -203,7 +217,17 @@ static int scan_power_front(struct talkman_cci_scan *s, bool on)
 	rc = scan_clk_on(s->mclk2_src, s->mclk2, s->mclk_rate);
 	if (rc)
 		goto err_vio;
-	msleep(3);
+	/*
+	 * CAM_FRONT_RES_N (schematic GPIO 104) is active-low. A SMIA sensor
+	 * held in reset never ACKs, so release it after rails + MCLK and
+	 * give the sensor its power-on settle before the SID sweep.
+	 */
+	if (gpio_is_valid(s->front_rst_gpio)) {
+		gpio_set_value(s->front_rst_gpio, 1);
+		pr_info("%s: front reset GPIO %d released\n", DRV_NAME,
+			s->front_rst_gpio);
+	}
+	msleep(10);
 	return 0;
 
 err_vio:
@@ -257,15 +281,17 @@ static int scan_master(struct talkman_cci_scan *s,
 	return found;
 }
 
-static int talkman_cci_do_scan(struct talkman_cci_scan *s)
+/*
+ * Allocate a CCI client and INIT both masters. Returns the number of
+ * successful INITs (each needs a matching MSM_CCI_RELEASE) or -errno.
+ */
+static int scan_cci_init(struct talkman_cci_scan *s,
+			 struct msm_camera_i2c_client *client,
+			 struct msm_camera_cci_client **out)
 {
 	struct msm_camera_cci_client *cci_client;
-	struct msm_camera_i2c_client client;
 	struct v4l2_subdev *sd;
-	int rc, found = 0, inited = 0;
-
-	s->buf_len = 0;
-	s->buf[0] = '\0';
+	int rc, inited = 0;
 
 	sd = msm_cci_get_subdev();
 	if (!sd) {
@@ -284,9 +310,9 @@ static int talkman_cci_do_scan(struct talkman_cci_scan *s)
 	cci_client->retries = 0;
 	cci_client->id_map = 0;
 	cci_client->i2c_freq_mode = I2C_FAST_MODE;
-	memset(&client, 0, sizeof(client));
-	client.cci_client = cci_client;
-	client.addr_type = MSM_CAMERA_I2C_WORD_ADDR;
+	memset(client, 0, sizeof(*client));
+	client->cci_client = cci_client;
+	client->addr_type = MSM_CAMERA_I2C_WORD_ADDR;
 
 	/*
 	 * MSM_CCI_INIT programs SCL/SDA timing only for cci_i2c_master,
@@ -297,21 +323,55 @@ static int talkman_cci_do_scan(struct talkman_cci_scan *s)
 	 * Second INIT (ref_count++) sets MASTER_0 clk params.
 	 */
 	cci_client->cci_i2c_master = MASTER_1;
-	rc = msm_sensor_cci_i2c_util(&client, MSM_CCI_INIT);
+	rc = msm_sensor_cci_i2c_util(client, MSM_CCI_INIT);
 	if (rc) {
 		pr_err("%s: CCI INIT master1 failed rc=%d\n", DRV_NAME, rc);
 		scan_append(s, "CCI INIT master1 failed %d\n", rc);
 		kfree(cci_client);
+		client->cci_client = NULL;
 		return rc;
 	}
 	inited++;
 
 	cci_client->cci_i2c_master = MASTER_0;
-	rc = msm_sensor_cci_i2c_util(&client, MSM_CCI_INIT);
+	rc = msm_sensor_cci_i2c_util(client, MSM_CCI_INIT);
 	if (rc)
 		pr_err("%s: CCI INIT master0 rc=%d\n", DRV_NAME, rc);
 	else
 		inited++;
+
+	*out = cci_client;
+	return inited;
+}
+
+static void scan_cci_release(struct msm_camera_i2c_client *client,
+			     struct msm_camera_cci_client *cci_client,
+			     int inited)
+{
+	while (inited-- > 0)
+		msm_sensor_cci_i2c_util(client, MSM_CCI_RELEASE);
+	kfree(cci_client);
+	client->cci_client = NULL;
+}
+
+static int talkman_cci_do_scan(struct talkman_cci_scan *s)
+{
+	struct msm_camera_cci_client *cci_client = NULL;
+	struct msm_camera_i2c_client client;
+	int rc, found = 0, inited;
+
+	s->buf_len = 0;
+	s->buf[0] = '\0';
+
+	if (s->held) {
+		scan_append(s, "power is held (%d); echo off > power first\n",
+			    s->held);
+		return -EBUSY;
+	}
+
+	inited = scan_cci_init(s, &client, &cci_client);
+	if (inited < 0)
+		return inited;
 
 	scan_pins(s, true);
 
@@ -341,9 +401,7 @@ static int talkman_cci_do_scan(struct talkman_cci_scan *s)
 	}
 
 	scan_pins(s, false);
-	while (inited--)
-		msm_sensor_cci_i2c_util(&client, MSM_CCI_RELEASE);
-	kfree(cci_client);
+	scan_cci_release(&client, cci_client, inited);
 	scan_append(s, "done, %d ACK(s)\n", found);
 	pr_info("%s: finished, %d ACK(s). Read debugfs for the table.\n",
 		DRV_NAME, found);
@@ -378,6 +436,174 @@ static const struct file_operations scan_fops = {
 	.open = simple_open,
 	.read = scan_read,
 	.write = scan_write,
+	.llseek = default_llseek,
+};
+
+/* ---- held power + raw CCI access ---------------------------------- */
+
+static void scan_hold_off(struct talkman_cci_scan *s)
+{
+	if (!s->held)
+		return;
+	if (s->held == 1)
+		scan_power_rear(s, false);
+	else
+		scan_power_front(s, false);
+	scan_pins(s, false);
+	scan_cci_release(&s->held_client, s->held_cci, s->held_inits);
+	s->held_cci = NULL;
+	s->held_inits = 0;
+	s->held = 0;
+	pr_info("%s: power off\n", DRV_NAME);
+	scan_append(s, "power off\n");
+}
+
+static int scan_hold_on(struct talkman_cci_scan *s, int which)
+{
+	int rc;
+
+	if (s->held)
+		scan_hold_off(s);
+
+	rc = scan_cci_init(s, &s->held_client, &s->held_cci);
+	if (rc < 0)
+		return rc;
+	s->held_inits = rc;
+	scan_pins(s, true);
+	rc = which == 1 ? scan_power_rear(s, true) : scan_power_front(s, true);
+	if (rc) {
+		pr_err("%s: %s power-up rc=%d\n", DRV_NAME,
+		       which == 1 ? "rear" : "front", rc);
+		scan_append(s, "%s power-up failed %d\n",
+			    which == 1 ? "rear" : "front", rc);
+		scan_pins(s, false);
+		scan_cci_release(&s->held_client, s->held_cci, s->held_inits);
+		s->held_cci = NULL;
+		s->held_inits = 0;
+		return rc;
+	}
+	s->held = which;
+	pr_info("%s: power held: %s\n", DRV_NAME,
+		which == 1 ? "rear (L25/L29/L23 VAF, mclk0)" :
+			     "front (L17, mclk2, GPIO104 released)");
+	scan_append(s, "power held: %s\n", which == 1 ? "rear" : "front");
+	return 0;
+}
+
+static ssize_t power_write(struct file *file, const char __user *ubuf,
+			   size_t count, loff_t *ppos)
+{
+	struct talkman_cci_scan *s = file->private_data;
+	char cmd[16];
+	int rc = 0;
+
+	if (count >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, ubuf, count))
+		return -EFAULT;
+	cmd[count] = '\0';
+	strim(cmd);
+
+	mutex_lock(&s->lock);
+	s->buf_len = 0;
+	s->buf[0] = '\0';
+	if (!strcmp(cmd, "rear") || !strcmp(cmd, "1"))
+		rc = scan_hold_on(s, 1);
+	else if (!strcmp(cmd, "front") || !strcmp(cmd, "2"))
+		rc = scan_hold_on(s, 2);
+	else if (!strcmp(cmd, "off") || !strcmp(cmd, "0"))
+		scan_hold_off(s);
+	else
+		rc = -EINVAL;
+	mutex_unlock(&s->lock);
+	return rc ? rc : count;
+}
+
+static const struct file_operations power_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = scan_read,
+	.write = power_write,
+	.llseek = default_llseek,
+};
+
+/*
+ * i2c: "r <master> <sid7> <reg> [alen] [dlen]"
+ *      "w <master> <sid7> <reg> <val> [alen] [dlen]"
+ * master 0/1, sid7 is the 7-bit address (BU24210 write 0x7c -> 0x3e),
+ * alen/dlen 1 or 2 bytes (default 2/1). Needs "power" held first.
+ * Result is appended to the shared buffer and printed to dmesg.
+ */
+static ssize_t i2c_write(struct file *file, const char __user *ubuf,
+			 size_t count, loff_t *ppos)
+{
+	struct talkman_cci_scan *s = file->private_data;
+	char cmd[96], op;
+	unsigned int master, sid, reg, val = 0, alen = 2, dlen = 1;
+	uint16_t data = 0;
+	int n, rc;
+
+	if (count >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, ubuf, count))
+		return -EFAULT;
+	cmd[count] = '\0';
+
+	if (sscanf(cmd, "%c", &op) != 1)
+		return -EINVAL;
+	if (op == 'r') {
+		n = sscanf(cmd, "%c %i %i %i %i %i",
+			   &op, &master, &sid, &reg, &alen, &dlen);
+		if (n < 4)
+			return -EINVAL;
+	} else if (op == 'w') {
+		n = sscanf(cmd, "%c %i %i %i %i %i %i",
+			   &op, &master, &sid, &reg, &val, &alen, &dlen);
+		if (n < 5)
+			return -EINVAL;
+	} else {
+		return -EINVAL;
+	}
+	if (master > 1 || sid > 0x7f ||
+	    (alen != 1 && alen != 2) || (dlen != 1 && dlen != 2))
+		return -EINVAL;
+
+	mutex_lock(&s->lock);
+	if (!s->held || !s->held_client.cci_client) {
+		scan_append(s, "power not held; echo rear > power first\n");
+		mutex_unlock(&s->lock);
+		return -ENXIO;
+	}
+	s->held_cci->cci_i2c_master = master ? MASTER_1 : MASTER_0;
+	s->held_cci->sid = sid;
+	s->held_client.addr_type = alen == 1 ? MSM_CAMERA_I2C_BYTE_ADDR :
+					       MSM_CAMERA_I2C_WORD_ADDR;
+	if (op == 'r') {
+		rc = msm_camera_cci_i2c_read(&s->held_client, reg, &data,
+					     dlen == 1 ? MSM_CAMERA_I2C_BYTE_DATA :
+							 MSM_CAMERA_I2C_WORD_DATA);
+		pr_info("%s: i2c r m%u sid=0x%02x reg=0x%04x -> 0x%0*x rc=%d\n",
+			DRV_NAME, master, sid, reg, dlen * 2, data, rc);
+		scan_append(s, "r m%u sid=0x%02x reg=0x%04x -> 0x%0*x rc=%d\n",
+			    master, sid, reg, dlen * 2, data, rc);
+	} else {
+		rc = msm_camera_cci_i2c_write(&s->held_client, reg, val,
+					      dlen == 1 ? MSM_CAMERA_I2C_BYTE_DATA :
+							  MSM_CAMERA_I2C_WORD_DATA);
+		pr_info("%s: i2c w m%u sid=0x%02x reg=0x%04x <- 0x%0*x rc=%d\n",
+			DRV_NAME, master, sid, reg, dlen * 2, val, rc);
+		scan_append(s, "w m%u sid=0x%02x reg=0x%04x <- 0x%0*x rc=%d\n",
+			    master, sid, reg, dlen * 2, val, rc);
+	}
+	mutex_unlock(&s->lock);
+	return rc ? rc : count;
+}
+
+static const struct file_operations i2c_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = scan_read,
+	.write = i2c_write,
 	.llseek = default_llseek,
 };
 
@@ -442,17 +668,34 @@ static int talkman_cci_scan_probe(struct platform_device *pdev)
 		s->pins_scan = pinctrl_lookup_state(s->pinctrl, "scan");
 	}
 
+	s->front_rst_gpio = of_get_named_gpio(np, "mmo,front-reset-gpio", 0);
+	if (gpio_is_valid(s->front_rst_gpio)) {
+		if (devm_gpio_request_one(&pdev->dev, s->front_rst_gpio,
+					  GPIOF_OUT_INIT_LOW,
+					  "CAM_FRONT_RES_N")) {
+			dev_warn(&pdev->dev, "front reset GPIO %d busy\n",
+				 s->front_rst_gpio);
+			s->front_rst_gpio = -1;
+		}
+	}
+
 	s->dbg = debugfs_create_dir(DRV_NAME, NULL);
 	if (s->dbg) {
-		struct dentry *scan;
+		struct dentry *d;
 
 		talkman_cci_scan_own(s->dbg, 0755);
-		scan = debugfs_create_file("scan", 0660, s->dbg, s, &scan_fops);
-		talkman_cci_scan_own(scan, 0660);
+		d = debugfs_create_file("scan", 0660, s->dbg, s, &scan_fops);
+		talkman_cci_scan_own(d, 0660);
+		d = debugfs_create_file("power", 0660, s->dbg, s, &power_fops);
+		talkman_cci_scan_own(d, 0660);
+		d = debugfs_create_file("i2c", 0660, s->dbg, s, &i2c_fops);
+		talkman_cci_scan_own(d, 0660);
 	}
 
 	platform_set_drvdata(pdev, s);
-	scan_append(s, "idle. echo 1 > /sys/kernel/debug/%s/scan\n", DRV_NAME);
+	scan_append(s,
+		    "idle. echo 1 > scan | echo rear|front|off > power | "
+		    "echo 'r <m> <sid7> <reg> [alen] [dlen]' > i2c\n");
 	dev_info(&pdev->dev,
 		 "CCI scanner ready (mclk %u Hz). echo 1 > /sys/kernel/debug/%s/scan\n",
 		 s->mclk_rate, DRV_NAME);
@@ -463,6 +706,9 @@ static int talkman_cci_scan_remove(struct platform_device *pdev)
 {
 	struct talkman_cci_scan *s = platform_get_drvdata(pdev);
 
+	mutex_lock(&s->lock);
+	scan_hold_off(s);
+	mutex_unlock(&s->lock);
 	debugfs_remove_recursive(s->dbg);
 	return 0;
 }
