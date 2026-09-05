@@ -75,6 +75,41 @@
 
 		ti,enable-gpio = <&pm8994_gpios 12 0>;
 
+		/*
+		 * PGA 0x16 = 15 dB, the chip default (SLAS978B 7.5.20,
+		 * PGA_GAIN = N - 7 dB). 15 dB with the Battery Tracking AGC
+		 * off power-cycled the PMIC mid-playback on an old BV-T5E
+		 * pack; 0x12 (11 dB) was the stable fallback. What makes
+		 * 15 dB acceptable again is the guard below, not a healthier
+		 * battery: drop back to <0x12> if the phone still resets.
+		 */
+		ti,pga-gain = <0x16>;
+
+		/*
+		 * Battery Tracking AGC (SLAS978B 7.3.10, 7.5.13-7.5.17).
+		 * LIM_EN, CONFIG2 bit 2. Above the inflection point the peak
+		 * output is limited by the boost rail; below it VLIM falls by
+		 * the slope for every volt VBAT drops, which is what cuts the
+		 * 2.5 A boost peaks (9.3) before the PMIC undervoltage trips.
+		 *
+		 * inflection 3600 mV -> 0x0B = 0x90. The TI characterisation
+		 *   in the datasheet uses 3.6 V, and the BV-T5E's loaded
+		 *   voltage on a near-empty or aged pack sits around there.
+		 * slope 6000 mV/V -> 0x0C = 0x81, the chip default region
+		 *   (0x80 = 5.97 V/V): at VBAT 3.3 V the peak drops by ~1.8 V,
+		 *   at 3.0 V by ~3.6 V.
+		 * attack 20 us/dB -> 0x0E[2:0] = 0, fastest, so a transient
+		 *   is caught within the boost's own response time.
+		 * release 575 ms/dB -> 0x0F[3:0] = 5, the register default,
+		 *   slow enough not to pump.
+		 * Register 0x0D takes the TAS2553 init value 0xA9 (8.3).
+		 */
+		ti,limiter-enable;
+		ti,battery-guard-inflection-mv = <3600>;
+		ti,battery-guard-slope-mv-per-v = <6000>;
+		ti,limiter-attack-us-per-db = <20>;
+		ti,limiter-release-ms-per-db = <575>;
+
 		pinctrl-names = "default";
 		pinctrl-0 = <&quat_mi2s_active>, <&quat_mi2s_sd2_active>;
 	};
