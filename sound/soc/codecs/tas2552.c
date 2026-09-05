@@ -43,13 +43,103 @@
  * a Lumia 950 by driving the loudspeaker at full volume. 11 dB is loud
  * enough and has proven stable; boards with a healthy battery can raise it
  * via the "ti,pga-gain" property.
+ *
+ * The brownout happened with the chip's Battery Tracking AGC switched off
+ * (LIM_EN, CONFIG2 bit 2, cleared by the 0xE3 written at probe). The AGC is
+ * the hardware feature TI provides for exactly this case (SLAS978B 7.3.10,
+ * 9.3): once VBAT drops below the inflection point (0x0B) the allowed peak
+ * output voltage falls with the slope in 0x0C, cutting the boost input
+ * current before the pack sags to the PMIC undervoltage trip. It is enabled
+ * with "ti,limiter-enable" and parametrised with the "ti,battery-guard-*"
+ * and "ti,limiter-*" properties; without them the register defaults stand
+ * and behaviour is unchanged.
  */
 #define TAS2552_PGA_GAIN_DEFAULT	0x12
 
 struct tas2552_priv {
+	struct snd_soc_codec *codec;
 	unsigned int sysclk;
 	int enable_gpio;
 	u8 pga_gain;
+
+	/* Battery Tracking AGC ("battery guard" + limiter), see tas2552.h */
+	bool limiter_enable;
+	int bg_inflection;	/* register 0x0B code, -1 = leave default */
+	int bg_slope;		/* register 0x0C code, -1 = leave default */
+	int lim_attack;		/* 0x0E ATTACK_TIME[2:0], -1 = leave default */
+	int lim_release;	/* 0x0F REL_TIME[3:0], -1 = leave default */
+};
+
+/* register 0x19 code -> millivolts, 0x50 = 2500 mV, 17.33 mV per LSB */
+static int tas2552_vbat_code_to_mv(unsigned int code)
+{
+	return TAS2552_VBAT_DATA_MV_MIN +
+	       (int)(code - TAS2552_VBAT_DATA_CODE_MIN) *
+	       TAS2552_BG_STEP_UV / 1000;
+}
+
+static int tas2552_read_vbat(struct tas2552_priv *tas2552, unsigned int *code)
+{
+	unsigned int val;
+
+	if (!tas2552->codec)
+		return -ENODEV;
+
+	val = snd_soc_read(tas2552->codec, TAS2552_REG_VBAT_DATA);
+	if (val > 0xFF)
+		return -EIO;
+
+	*code = val;
+	return 0;
+}
+
+/*
+ * /sys/bus/i2c/devices/<bus>-0040/vbat_mv: what the amplifier's own battery
+ * monitor sees, so the guard can be checked against the fuel gauge. Reads 0
+ * while the device is in software shutdown (code below 0x50 is reserved and
+ * the datasheet says VBAT data is only valid while the AGC is running).
+ */
+static ssize_t tas2552_vbat_mv_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct tas2552_priv *tas2552 = dev_get_drvdata(dev);
+	unsigned int code;
+	int ret;
+
+	ret = tas2552_read_vbat(tas2552, &code);
+	if (ret)
+		return ret;
+
+	if (code < TAS2552_VBAT_DATA_CODE_MIN)
+		return scnprintf(buf, PAGE_SIZE, "0\n");
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", tas2552_vbat_code_to_mv(code));
+}
+static DEVICE_ATTR(vbat_mv, S_IRUGO, tas2552_vbat_mv_show, NULL);
+
+static ssize_t tas2552_vbat_raw_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct tas2552_priv *tas2552 = dev_get_drvdata(dev);
+	unsigned int code;
+	int ret;
+
+	ret = tas2552_read_vbat(tas2552, &code);
+	if (ret)
+		return ret;
+
+	return scnprintf(buf, PAGE_SIZE, "0x%02x\n", code);
+}
+static DEVICE_ATTR(vbat_raw, S_IRUGO, tas2552_vbat_raw_show, NULL);
+
+static struct attribute *tas2552_attrs[] = {
+	&dev_attr_vbat_mv.attr,
+	&dev_attr_vbat_raw.attr,
+	NULL,
+};
+
+static const struct attribute_group tas2552_attr_group = {
+	.attrs = tas2552_attrs,
 };
 
 static int tas2552_set_pll_clk(struct snd_soc_codec *codec,
@@ -131,7 +221,13 @@ static int tas2552_codec_probe(struct snd_soc_codec *codec)
 	}
 
 	snd_soc_write(codec, TAS2552_REG_CONFIG1, 0x02);
-	snd_soc_write(codec, TAS2552_REG_CONFIG2, 0xE3);
+	/*
+	 * 0xE3: CLASSD_EN, BOOST_EN, APT_EN, IVSENSE_EN and the bit 0 that the
+	 * initialisation sequence clears at bias-on. PLL_EN is raised at
+	 * bias-on. LIM_EN (bit 2) only when the DT asks for the battery guard.
+	 */
+	snd_soc_write(codec, TAS2552_REG_CONFIG2, 0xE3 |
+		      (tas2552->limiter_enable ? TAS2552_CONFIG2_LIM_EN : 0));
 	/*
 	 * 0x5D selects 44.1/48 kHz word clock and, importantly, leaves the
 	 * analog input select bit clear so the I2S data reaches the speaker.
@@ -141,6 +237,39 @@ static int tas2552_codec_probe(struct snd_soc_codec *codec)
 	snd_soc_write(codec, TAS2552_REG_PGA_GAIN, tas2552->pga_gain);
 	snd_soc_write(codec, TAS2552_REG_BOOST_AUTO_PASS_THROUGH_CTRL, 0x0F);
 
+	/*
+	 * Battery Tracking AGC parameters (SLAS978B 7.5.13 - 7.5.17). These
+	 * belong to the "configure device register" part of the init sequence
+	 * (8.3); the 0x0D / 0x0E[5] / 0x02[0] / 0x01[1] tail is written in
+	 * tas2552_set_bias_level() when the stream starts.
+	 */
+	if (tas2552->bg_inflection >= 0)
+		snd_soc_write(codec, TAS2552_REG_BATTERY_GUARD_INFLECTION_PT,
+			      tas2552->bg_inflection);
+	if (tas2552->bg_slope >= 0)
+		snd_soc_write(codec, TAS2552_REG_BATTERY_GUARD_SLOPE_CTRL,
+			      tas2552->bg_slope);
+	if (tas2552->lim_attack >= 0)
+		snd_soc_update_bits(codec, TAS2552_REG_LIMITER_AR_HT,
+				    TAS2552_LIMITER_ATTACK_TIME_MSK,
+				    tas2552->lim_attack);
+	if (tas2552->lim_release >= 0)
+		snd_soc_update_bits(codec, TAS2552_REG_LIMITER_RELEASE_RATE,
+				    TAS2552_LIMITER_RELEASE_TIME_MSK,
+				    tas2552->lim_release);
+
+	tas2552->codec = codec;
+
+	ret = snd_soc_read(codec, TAS2552_REG_VERSION_NUMBER);
+	dev_info(codec->dev,
+		 "silicon version 0x%x, battery guard %s (0x0B=0x%02x 0x0C=0x%02x 0x0E=0x%02x 0x0F=0x%02x)\n",
+		 ret & TAS2552_VERSION_SILICON_VER_MSK,
+		 tas2552->limiter_enable ? "on" : "off",
+		 snd_soc_read(codec, TAS2552_REG_BATTERY_GUARD_INFLECTION_PT),
+		 snd_soc_read(codec, TAS2552_REG_BATTERY_GUARD_SLOPE_CTRL),
+		 snd_soc_read(codec, TAS2552_REG_LIMITER_AR_HT),
+		 snd_soc_read(codec, TAS2552_REG_LIMITER_RELEASE_RATE));
+
 	return 0;
 }
 
@@ -148,10 +277,27 @@ static int tas2552_codec_remove(struct snd_soc_codec *codec)
 {
 	struct tas2552_priv *tas2552 = snd_soc_codec_get_drvdata(codec);
 
+	tas2552->codec = NULL;
+
 	if (gpio_is_valid(tas2552->enable_gpio))
 		gpio_set_value(tas2552->enable_gpio, 0);
 
 	return 0;
+}
+
+/* Read-only status registers must bypass the ASoC register cache. */
+static int tas2552_volatile_register(struct snd_soc_codec *codec,
+				     unsigned int reg)
+{
+	switch (reg) {
+	case TAS2552_REG_DEVICE_STATUS:
+	case TAS2552_REG_VERSION_NUMBER:
+	case TAS2552_REG_VBOOST_DATA:
+	case TAS2552_REG_VBAT_DATA:
+		return 1;
+	default:
+		return 0;
+	}
 }
 
 static int tas2552_set_bias_level(struct snd_soc_codec *codec,
@@ -166,8 +312,9 @@ static int tas2552_set_bias_level(struct snd_soc_codec *codec,
 		snd_soc_update_bits(codec, TAS2552_REG_CONFIG3,
 			TAS2552_CONFIG3_SOURCE_SELECT_MSK,
 			TAS2552_CONFIG3_SOURCE_SELECT_NONE);
+		/* TAS2553 initialisation value (SLAS978B 8.3); TAS2552 is 0xC0 */
 		snd_soc_write(codec, TAS2552_REG_LIMITER_LEVEL_CTRL,
-			TAS2552_LIMITER_LEVEL_CTRL_INIT_EN);
+			TAS2553_LIMITER_LEVEL_CTRL_INIT_EN);
 		snd_soc_update_bits(codec, TAS2552_REG_LIMITER_AR_HT,
 			TAS2552_LIMITER_AR_HT_INIT_MSK,
 			TAS2552_LIMITER_AR_HT_INIT_EN);
@@ -268,6 +415,7 @@ static const struct snd_soc_codec_driver tas2552_codec_drv = {
 	.reg_cache_size = ARRAY_SIZE(tas2552_reg_defaults),
 	.reg_word_size = sizeof(tas2552_reg_defaults[0]),
 	.reg_cache_default = tas2552_reg_defaults,
+	.volatile_register = tas2552_volatile_register,
 	.set_bias_level = tas2552_set_bias_level,
 	.idle_bias_off = 1,
 };
@@ -475,7 +623,7 @@ static struct snd_soc_dai_driver tas2552_dai = {
 
 static int tas2552_parse_dt(struct device *dev, struct tas2552_priv *tas2552)
 {
-	u32 gain;
+	u32 gain, val;
 	int ret;
 
 	tas2552->enable_gpio = of_get_named_gpio(dev->of_node,
@@ -496,6 +644,81 @@ static int tas2552_parse_dt(struct device *dev, struct tas2552_priv *tas2552)
 			return -EINVAL;
 		}
 		tas2552->pga_gain = gain;
+	}
+
+	tas2552->limiter_enable = of_property_read_bool(dev->of_node,
+							"ti,limiter-enable");
+	tas2552->bg_inflection = -1;
+	tas2552->bg_slope = -1;
+	tas2552->lim_attack = -1;
+	tas2552->lim_release = -1;
+
+	/* 0x0B INFLECTION: 0x6D = 3000 mV, 17.33 mV per step, 0xFE = 5500 mV */
+	ret = of_property_read_u32(dev->of_node,
+				   "ti,battery-guard-inflection-mv", &val);
+	if (!ret) {
+		if (val < TAS2552_BG_INFLECTION_MV_MIN ||
+		    val > TAS2552_BG_INFLECTION_MV_MAX) {
+			dev_err(dev, "ti,battery-guard-inflection-mv %u out of range (3000-5500)\n",
+				val);
+			return -EINVAL;
+		}
+		tas2552->bg_inflection = TAS2552_BG_INFLECTION_CODE_MIN +
+			DIV_ROUND_CLOSEST((val - TAS2552_BG_INFLECTION_MV_MIN) *
+					  1000, TAS2552_BG_STEP_UV);
+		if (tas2552->bg_inflection > TAS2552_BG_INFLECTION_CODE_MAX)
+			tas2552->bg_inflection = TAS2552_BG_INFLECTION_CODE_MAX;
+	}
+
+	/* 0x0C SLOPE: 0x00 = 1.2 V/V, 37.3 mV/V per step, 0xFF = 10.75 V/V */
+	ret = of_property_read_u32(dev->of_node,
+				   "ti,battery-guard-slope-mv-per-v", &val);
+	if (!ret) {
+		if (val < TAS2552_BG_SLOPE_MVV_MIN ||
+		    val > TAS2552_BG_SLOPE_MVV_MAX) {
+			dev_err(dev, "ti,battery-guard-slope-mv-per-v %u out of range (1200-10750)\n",
+				val);
+			return -EINVAL;
+		}
+		tas2552->bg_slope = DIV_ROUND_CLOSEST(
+			(val - TAS2552_BG_SLOPE_MVV_MIN) * 1000,
+			TAS2552_BG_SLOPE_STEP_UVV);
+		if (tas2552->bg_slope > 0xFF)
+			tas2552->bg_slope = 0xFF;
+	}
+
+	/* 0x0E ATTACK_TIME[2:0]: 20 us/dB + 350 us/dB per step, max 2470 */
+	ret = of_property_read_u32(dev->of_node,
+				   "ti,limiter-attack-us-per-db", &val);
+	if (!ret) {
+		if (val < TAS2552_LIMITER_ATTACK_US_MIN ||
+		    val > TAS2552_LIMITER_ATTACK_US_MIN +
+			  TAS2552_LIMITER_ATTACK_CODE_MAX *
+			  TAS2552_LIMITER_ATTACK_US_STEP) {
+			dev_err(dev, "ti,limiter-attack-us-per-db %u out of range (20-2470)\n",
+				val);
+			return -EINVAL;
+		}
+		tas2552->lim_attack = DIV_ROUND_CLOSEST(
+			val - TAS2552_LIMITER_ATTACK_US_MIN,
+			TAS2552_LIMITER_ATTACK_US_STEP);
+	}
+
+	/* 0x0F REL_TIME[3:0]: 50 ms/dB + 105 ms/dB per step, max 1625 */
+	ret = of_property_read_u32(dev->of_node,
+				   "ti,limiter-release-ms-per-db", &val);
+	if (!ret) {
+		if (val < TAS2552_LIMITER_RELEASE_MS_MIN ||
+		    val > TAS2552_LIMITER_RELEASE_MS_MIN +
+			  TAS2552_LIMITER_RELEASE_CODE_MAX *
+			  TAS2552_LIMITER_RELEASE_MS_STEP) {
+			dev_err(dev, "ti,limiter-release-ms-per-db %u out of range (50-1625)\n",
+				val);
+			return -EINVAL;
+		}
+		tas2552->lim_release = DIV_ROUND_CLOSEST(
+			val - TAS2552_LIMITER_RELEASE_MS_MIN,
+			TAS2552_LIMITER_RELEASE_MS_STEP);
 	}
 
 	return 0;
@@ -541,13 +764,19 @@ static int tas2552_i2c_probe(struct i2c_client *client,
 		return ret;
 	}
 
-	dev_info(&client->dev, "TAS2552 registered, PGA gain %d dB\n",
-		 tas2552->pga_gain - 7);
+	ret = sysfs_create_group(&client->dev.kobj, &tas2552_attr_group);
+	if (ret)
+		dev_warn(&client->dev, "no vbat sysfs files: %d\n", ret);
+
+	dev_info(&client->dev, "TAS2552 registered, PGA gain %d dB, battery guard %s\n",
+		 tas2552->pga_gain - 7,
+		 tas2552->limiter_enable ? "enabled" : "disabled");
 	return 0;
 }
 
 static int tas2552_i2c_remove(struct i2c_client *client)
 {
+	sysfs_remove_group(&client->dev.kobj, &tas2552_attr_group);
 	snd_soc_unregister_codec(&client->dev);
 	return 0;
 }

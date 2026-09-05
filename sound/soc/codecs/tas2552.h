@@ -69,6 +69,15 @@
 #define TAS2552_CONFIG2_PLL_EN_POS			3
 #define TAS2552_CONFIG2_PLL_EN_ENABLE			(0x1 << TAS2552_CONFIG2_PLL_EN_POS)
 
+/*
+ * LIM_EN, "Battery Tracking AGC Enable" (TAS2553 SLAS978B 7.5.4, Register
+ * 0x02 bit 2; identical on the TAS2552, SLAS898B). This is the only enable
+ * for the battery guard / limiter; registers 0x0B-0x10 just parametrise it.
+ */
+#define TAS2552_CONFIG2_LIM_EN_MSK			0x4
+#define TAS2552_CONFIG2_LIM_EN_POS			2
+#define TAS2552_CONFIG2_LIM_EN				(0x1 << TAS2552_CONFIG2_LIM_EN_POS)
+
 /* TAS2552_REG_CONFIG3 (0x03) */
 #define TAS2552_CONFIG3_WCLK_MSK			0x7
 #define TAS2552_CONFIG3_WCLK_POS			0
@@ -140,16 +149,69 @@
 /* TAS2552_REG_PLLCTRL3 (0x0A) */
 #define TAS2552_PLLCTRL3_D_BIT7_0_MSK			0xFF
 
-/* TAS2552_REG_LIMITER_LEVEL_CTRL (0x0D) */
+/*
+ * TAS2552_REG_BATTERY_GUARD_INFLECTION_PT (0x0B), INFLECTION[7:0]
+ * (SLAS978B 7.5.13). VBAT above which VLIM is set by the boost voltage.
+ * 0x6D = 3.00 V ... 0xFE = 5.50 V in 17.33 mV steps; 0x00-0x6C and 0xFF
+ * are reserved. Chip default 0x8F is 3.59 V.
+ */
+#define TAS2552_BG_INFLECTION_CODE_MIN			0x6D
+#define TAS2552_BG_INFLECTION_CODE_MAX			0xFE
+#define TAS2552_BG_INFLECTION_MV_MIN			3000
+#define TAS2552_BG_INFLECTION_MV_MAX			5500
+#define TAS2552_BG_STEP_UV				17330
+
+/*
+ * TAS2552_REG_BATTERY_GUARD_SLOPE_CTRL (0x0C), SLOPE[7:0] (SLAS978B 7.5.14).
+ * dVLIM/dVBAT below the inflection point: 1.2 V/V + 37.3 mV/V per step,
+ * 0x00 = 1.2 V/V ... 0xFF = 10.75 V/V. Chip default 0x80 is 5.97 V/V.
+ */
+#define TAS2552_BG_SLOPE_MVV_MIN			1200
+#define TAS2552_BG_SLOPE_MVV_MAX			10750
+#define TAS2552_BG_SLOPE_STEP_UVV			37300
+
+/*
+ * TAS2552_REG_LIMITER_LEVEL_CTRL (0x0D). Reserved on both parts; the
+ * datasheets only give a value to write in the initialisation sequence:
+ * TAS2552 SLAS898B 7.5.15 says 0xC0, TAS2553 SLAS978B 7.5.15 says 0xA9.
+ */
 #define TAS2552_LIMITER_LEVEL_CTRL_INIT_MSK		0xFF
 #define TAS2552_LIMITER_LEVEL_CTRL_INIT_DEFAULT		0xBE
 #define TAS2552_LIMITER_LEVEL_CTRL_INIT_EN		0xC0
+#define TAS2553_LIMITER_LEVEL_CTRL_INIT_EN		0xA9
 
-/* TAS2552_REG_LIMITER_AR_HT (0x0E) */
+/* TAS2552_REG_LIMITER_AR_HT (0x0E), SLAS978B 7.5.16 */
 #define TAS2552_LIMITER_AR_HT_INIT_MSK			0x20
 #define TAS2552_LIMITER_AR_HT_INIT_POS			5
 #define TAS2552_LIMITER_AR_HT_INIT_DEFAULT		0x0
 #define TAS2552_LIMITER_AR_HT_INIT_EN			(0x1 << TAS2552_LIMITER_AR_HT_INIT_POS)
+
+/* ATTACK_TIME[2:0]: 000 = 20 us/dB, then 350 us/dB per step, 111 = 2470 */
+#define TAS2552_LIMITER_ATTACK_TIME_MSK			0x7
+#define TAS2552_LIMITER_ATTACK_US_MIN			20
+#define TAS2552_LIMITER_ATTACK_US_STEP			350
+#define TAS2552_LIMITER_ATTACK_CODE_MAX			0x7
+
+/*
+ * TAS2552_REG_LIMITER_RELEASE_RATE (0x0F), REL_TIME[3:0] (SLAS978B 7.5.17):
+ * 0000 = 50 ms/dB, then 105 ms/dB per step, 1111 = 1625 ms/dB.
+ */
+#define TAS2552_LIMITER_RELEASE_TIME_MSK		0xF
+#define TAS2552_LIMITER_RELEASE_MS_MIN			50
+#define TAS2552_LIMITER_RELEASE_MS_STEP			105
+#define TAS2552_LIMITER_RELEASE_CODE_MAX		0xF
+
+/*
+ * TAS2552_REG_VBAT_DATA (0x19), VBAT[7:0] (SLAS978B 7.5.27). Read-only,
+ * 1 LSB ~ 17.33 mV, 0x50 = 2.5 V ... 0xFF = 5.55 V; codes below 0x50 are
+ * reserved and are what the register reads while the guard is not
+ * running (device in software shutdown).
+ */
+#define TAS2552_VBAT_DATA_CODE_MIN			0x50
+#define TAS2552_VBAT_DATA_MV_MIN			2500
+
+/* TAS2552_REG_VERSION_NUMBER (0x16), SILICON_VER[3:0]; TAS2553 reads 0x8 */
+#define TAS2552_VERSION_SILICON_VER_MSK			0xF
 
 /* TAS2552_REG_PGA_GAIN (0x12) */
 #define TAS2552_PGA_GAIN_POS				0
