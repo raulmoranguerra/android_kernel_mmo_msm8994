@@ -1366,9 +1366,16 @@ int mdss_mdp_overlay_start(struct msm_fb_data_type *mfd)
 			return 0;
 		}
 	} else if (mdata->handoff_pending) {
-		pr_warn("fb%d: commit while splash handoff pending\n",
+		/*
+		 * The bootloader left the interface running (e.g. lk2nd's
+		 * fastboot screen) but this panel has no continuous splash,
+		 * so nothing will ever claim the handoff. Drop the splash
+		 * votes, which power-collapses MDP, and bring the panel up
+		 * from scratch instead of refusing every commit.
+		 */
+		pr_warn("fb%d: bootloader display on without cont-splash, dropping handoff\n",
 				mfd->index);
-		return -EPERM;
+		mdss_mdp_footswitch_ctrl_splash(false);
 	}
 
 	pr_debug("starting fb%d overlay\n", mfd->index);
