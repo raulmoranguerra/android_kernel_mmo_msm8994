@@ -270,13 +270,19 @@
 		};
 	};
 
+	/*
+	 * L23 VAF, L25 VDIG, L29 VANA feed only the rear camera module (IMX230
+	 * + BU24210 OIS/AF); the sensor driver sequences them through
+	 * cam_v*-supply in talkman-camera.dtsi. The MMO import held them
+	 * always-on, which kept the BU24210 powered across reboots (it never
+	 * left a bad firmware state) and burned idle current.
+	 */
 	rpm-regulator-ldoa23 {
 		status = "okay";
 		pm8994_l23: regulator-l23 {
 			regulator-min-microvolt = <2850000>;
 			regulator-max-microvolt = <2850000>;
 			qcom,init-voltage = <2850000>;
-			regulator-always-on;
 			status = "okay";
 		};
 	};
@@ -297,7 +303,6 @@
 			regulator-min-microvolt = <1150000>;
 			regulator-max-microvolt = <1150000>;
 			qcom,init-voltage = <1150000>;
-			regulator-always-on;
 			status = "okay";
 		};
 	};
@@ -343,7 +348,6 @@
 			regulator-min-microvolt = <2850000>;
 			regulator-max-microvolt = <2850000>;
 			qcom,init-voltage = <2850000>;
-			regulator-always-on;
 			status = "okay";
 		};
 	};
