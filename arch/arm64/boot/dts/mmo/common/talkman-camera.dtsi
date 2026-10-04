@@ -86,10 +86,16 @@
 		cam_vdig-supply = <&pm8994_l25>;
 		cam_vana-supply = <&pm8994_l29>;
 		cam_vaf-supply = <&pm8994_l23>;
-		qcom,cam-vreg-name = "cam_vdig", "cam_vana", "cam_vaf";
-		qcom,cam-vreg-min-voltage = <1150000 2850000 2850000>;
-		qcom,cam-vreg-max-voltage = <1150000 2850000 2850000>;
-		qcom,cam-vreg-op-mode = <105000 80000 100000>;
+		cam_vio-supply = <&pm8994_lvs1>;
+		/*
+		 * Order is the CAM_VDIG/VIO/VANA/VAF enum order: the DT power
+		 * parser stores vreg indices and msm_camera_fill_vreg_params
+		 * reads them back as that enum. LVS1 is a switch (0 V).
+		 */
+		qcom,cam-vreg-name = "cam_vdig", "cam_vio", "cam_vana", "cam_vaf";
+		qcom,cam-vreg-min-voltage = <1150000 0 2850000 2850000>;
+		qcom,cam-vreg-max-voltage = <1150000 0 2850000 2850000>;
+		qcom,cam-vreg-op-mode = <105000 0 80000 100000>;
 		qcom,gpio-no-mux = <0>;
 		pinctrl-names = "cam_default", "cam_suspend";
 		pinctrl-0 = <&cam_sensor_mclk0_active>;
@@ -98,14 +104,21 @@
 		qcom,gpio-req-tbl-num = <0>;
 		qcom,gpio-req-tbl-flags = <1>;
 		qcom,gpio-req-tbl-label = "CAMIF_MCLK0";
+		/*
+		 * clark's library sequence drives GPIO VANA/STANDBY/RESET that
+		 * talkman does not have and never enables VANA/VIO here; use
+		 * this sequence instead (msm_sensor_driver "mmo,dt-power-seq").
+		 * VIO first so the I2C pads are up, as talkman-cci-scan does.
+		 */
+		mmo,dt-power-seq;
 		qcom,cam-power-seq-type = "sensor_vreg", "sensor_vreg",
-			"sensor_vreg", "sensor_clk";
-		qcom,cam-power-seq-val = "cam_vdig", "cam_vana", "cam_vaf",
-			"sensor_cam_mclk";
+			"sensor_vreg", "sensor_vreg", "sensor_clk";
+		qcom,cam-power-seq-val = "cam_vio", "cam_vana", "cam_vdig",
+			"cam_vaf", "sensor_cam_mclk";
 		/* Clark libmmcamera_mot_imx230.so votes 24 MHz INCK.
 		 * WOA PEP 9.6 MHz is enough for CCI; CSI PLL wants 24. */
-		qcom,cam-power-seq-cfg-val = <1 1 1 24000000>;
-		qcom,cam-power-seq-delay = <1 1 1 5>;
+		qcom,cam-power-seq-cfg-val = <1 1 1 1 24000000>;
+		qcom,cam-power-seq-delay = <1 1 1 1 5>;
 		qcom,sensor-position = <0>;
 		qcom,sensor-mode = <0>;
 		qcom,cci-master = <1>;
