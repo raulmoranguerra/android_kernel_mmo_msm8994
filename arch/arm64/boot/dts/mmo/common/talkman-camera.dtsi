@@ -7,8 +7,9 @@
  *       TORCH_EN GPIO 12 (torch.dtsi). No PMI flash bind.
  * Rear XSHUTDOWN is not labelled on the drawing — do not copy MTP 91/92.
  *
- * Front (disabled, no CameraId 1): CSI2, CCI0, CAM_MCLK2 GPIO 15,
- *       CAM_FRONT_RES_N GPIO 104. GPIO 105 is not on the drawing.
+ * Front: ST VD6955 (module "Ducati" 0x2140) on CSI2, CCI0 0x20,
+ *       CAM_MCLK2 GPIO 15, CAM_FRONT_RES_N GPIO 104. GPIO 105 is not on
+ *       the drawing.
  * Iris (disabled): CCI0, CAM_MCLK1 GPIO 14, IRIS_CAM_RES_N GPIO 102.
  *
  * Rear qcom,slave-id is the on-device CCI1 ACK (write 0x20, id 0x0230).
@@ -39,10 +40,9 @@
 			<&clock_mmss clk_camss_mclk2_clk>;
 		clock-names = "mclk0_src", "mclk0", "mclk2_src", "mclk2";
 		qcom,mclk-rate = <24000000>;
-		/* Schematic CAM_FRONT_RES_N. Released (high) during the front
-		 * sweep so a sensor held in reset can ACK. camera@1 is
-		 * disabled, so the scanner may own the GPIO. */
-		mmo,front-reset-gpio = <&msm_gpio 104 0>;
+		/* No mmo,front-reset-gpio: camera@1 owns CAM_FRONT_RES_N
+		 * (GPIO 104), so the front sweep only sees the VD6955 while
+		 * a camera session holds it out of reset. */
 		pinctrl-names = "default", "scan";
 		pinctrl-0 = <&cam_sensor_mclk0_suspend
 			     &cam_sensor_mclk2_suspend
@@ -173,19 +173,27 @@
 		clock-names = "cam_src_clk", "cam_clk";
 	};
 
-	/* Front SMIA — schematic only. No CameraId 1 XML. No SID. */
+	/*
+	 * Front: ST VD6955 (SMIA, model 0x03BB at 0x0016, manufacturer 0x01),
+	 * module "Ducati" (0x2140 at 0x0000). On-device talkman-cci-scan:
+	 * CCI0 ACK sid=0x10 wr=0x20. Power sequence from the Windows PEP
+	 * component \_SB.CAMF (PLAT ACPI DSDT): L17 2.8 V, LVS1, CSI2/PHY2
+	 * clocks, MCLK2 9.6 MHz on GPIO 15, then GPIO 104 high and 3 ms.
+	 * No VDIG rail (the sensor regulates its core itself).
+	 */
 	qcom,camera@1 {
 		cell-index = <1>;
 		compatible = "qcom,camera";
 		reg = <0x1>;
 		qcom,csiphy-sd-index = <2>;
 		qcom,csid-sd-index = <2>;
-		qcom,mount-angle = <90>;
+		qcom,mount-angle = <270>;
+		cam_vio-supply = <&pm8994_lvs1>;
 		cam_vana-supply = <&pm8994_l17>;
-		qcom,cam-vreg-name = "cam_vana";
-		qcom,cam-vreg-min-voltage = <2800000>;
-		qcom,cam-vreg-max-voltage = <2800000>;
-		qcom,cam-vreg-op-mode = <80000>;
+		qcom,cam-vreg-name = "cam_vio", "cam_vana";
+		qcom,cam-vreg-min-voltage = <0 2800000>;
+		qcom,cam-vreg-max-voltage = <0 2800000>;
+		qcom,cam-vreg-op-mode = <0 80000>;
 		qcom,gpio-no-mux = <0>;
 		pinctrl-names = "cam_default", "cam_suspend";
 		pinctrl-0 = <&cam_sensor_mclk2_active &cam_sensor_front_rst_active>;
@@ -197,10 +205,18 @@
 		qcom,gpio-req-tbl-flags = <1 0>;
 		qcom,gpio-req-tbl-label = "CAMIF_MCLK2",
 					  "CAM_FRONT_RES_N";
+		mmo,dt-power-seq;
+		qcom,cam-power-seq-type = "sensor_gpio", "sensor_vreg",
+			"sensor_vreg", "sensor_clk", "sensor_gpio";
+		qcom,cam-power-seq-val = "sensor_gpio_reset", "cam_vana",
+			"cam_vio", "sensor_cam_mclk", "sensor_gpio_reset";
+		qcom,cam-power-seq-cfg-val = <0 1 1 9600000 1>;
+		qcom,cam-power-seq-delay = <1 1 1 1 3>;
 		qcom,sensor-position = <1>;
 		qcom,sensor-mode = <0>;
 		qcom,cci-master = <0>;
-		status = "disabled";
+		qcom,slave-id = <0x20 0x0016 0x03bb>;
+		status = "ok";
 		clocks = <&clock_mmss clk_mclk2_clk_src>,
 			<&clock_mmss clk_camss_mclk2_clk>;
 		clock-names = "cam_src_clk", "cam_clk";
