@@ -450,6 +450,23 @@ static int32_t msm_flash_init(
 		return 0;
 	}
 
+	/*
+	 * A flash library borrowed from another phone (Motorola clark
+	 * libflash_sky81296.so on talkman) asks for its own I2C flash chip.
+	 * With "mmo,flash-type-from-dt" the board's flash (PMI8994 LEDs on
+	 * talkman) is used as if the library had asked for the default.
+	 */
+	if (flash_ctrl->pdev && of_property_read_bool(flash_ctrl->pdev->dev.of_node,
+			"mmo,flash-type-from-dt") &&
+	    flash_data->cfg.flash_init_info->flash_driver_type !=
+			FLASH_DRIVER_DEFAULT) {
+		pr_info("%s: library flash type %d, using DT type %d\n", __func__,
+			flash_data->cfg.flash_init_info->flash_driver_type,
+			flash_ctrl->flash_driver_type);
+		flash_data->cfg.flash_init_info->flash_driver_type =
+			FLASH_DRIVER_DEFAULT;
+	}
+
 	if (flash_data->cfg.flash_init_info->flash_driver_type ==
 		FLASH_DRIVER_DEFAULT) {
 		flash_driver_type = flash_ctrl->flash_driver_type;
