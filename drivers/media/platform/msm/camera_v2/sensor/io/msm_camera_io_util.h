@@ -71,5 +71,7 @@ int msm_camera_request_gpio_table(struct gpio *gpio_tbl, uint8_t size,
 void msm_cam_dump_mclk0_pad(const char *why, int fix);
 /* Talkman: clock a wedged CCI I2C bus free through TLMM. Returns SDA level. */
 int msm_cam_talkman_i2c_bus_recover(u32 sda_gpio, u32 scl_gpio);
+int msm_cam_talkman_i2c_bitbang_write(u32 sda_gpio, u32 scl_gpio,
+				      u8 addr7, const u8 *data, u32 len);
 
 #endif

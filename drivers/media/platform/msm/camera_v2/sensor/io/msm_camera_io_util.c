@@ -313,6 +313,111 @@ int msm_cam_talkman_i2c_bus_recover(u32 sda_gpio, u32 scl_gpio)
 }
 EXPORT_SYMBOL(msm_cam_talkman_i2c_bus_recover);
 
+/*
+ * Bit-banged I2C write on CCI pads muxed to GPIO, for slaves that need
+ * one long transaction (BU24210 DTI: [S 7C 05 84 d0..d63 P]). The CCI
+ * v1.1 block on MSM8992 caps a write command at 10 data bytes and issues
+ * each command as its own START..STOP, re-addressing the register, which
+ * a page-buffer style slave does not accept as one stream. ~100 kHz,
+ * clock stretching honoured up to 1 ms. Returns 0, -EIO on NAK, -ETIMEDOUT.
+ * The CCI hardware must be idle on this master while we hold the pads.
+ */
+#define BB_HALF_US	5
+
+static int bb_scl_high(u32 scl)
+{
+	int i;
+
+	talkman_pad_drive_low(scl, false);
+	for (i = 0; i < 200; i++) {
+		if (talkman_pad_in(scl))
+			return 0;
+		udelay(5);
+	}
+	return -ETIMEDOUT;
+}
+
+static int bb_write_byte(u32 sda, u32 scl, u8 b)
+{
+	int i, rc, ack;
+
+	for (i = 7; i >= 0; i--) {
+		talkman_pad_drive_low(sda, !((b >> i) & 1));
+		udelay(BB_HALF_US);
+		rc = bb_scl_high(scl);
+		if (rc)
+			return rc;
+		udelay(BB_HALF_US);
+		talkman_pad_drive_low(scl, true);
+	}
+	talkman_pad_drive_low(sda, false);
+	udelay(BB_HALF_US);
+	rc = bb_scl_high(scl);
+	if (rc)
+		return rc;
+	ack = !talkman_pad_in(sda);
+	udelay(BB_HALF_US);
+	talkman_pad_drive_low(scl, true);
+	udelay(BB_HALF_US);
+	return ack ? 0 : -EIO;
+}
+
+int msm_cam_talkman_i2c_bitbang_write(u32 sda_gpio, u32 scl_gpio,
+				      u8 addr7, const u8 *data, u32 len)
+{
+	u32 sda_cfg, scl_cfg, gpio_cfg, i;
+	int rc = 0;
+
+	if (!talkman_tlmm)
+		talkman_tlmm = ioremap(TALKMAN_TLMM_PHYS, TALKMAN_TLMM_SIZE);
+	if (!talkman_tlmm)
+		return -ENOMEM;
+	if (sda_gpio > 145 || scl_gpio > 145)
+		return -EINVAL;
+
+	sda_cfg = readl_relaxed(talkman_tlmm + TALKMAN_GP_CFG(sda_gpio));
+	scl_cfg = readl_relaxed(talkman_tlmm + TALKMAN_GP_CFG(scl_gpio));
+	gpio_cfg = sda_cfg & ~(TALKMAN_GP_FUNC_MASK << TALKMAN_GP_FUNC_SHFT);
+	gpio_cfg &= ~BIT(TALKMAN_GP_OE_BIT);
+	writel_relaxed(gpio_cfg, talkman_tlmm + TALKMAN_GP_CFG(sda_gpio));
+	gpio_cfg = scl_cfg & ~(TALKMAN_GP_FUNC_MASK << TALKMAN_GP_FUNC_SHFT);
+	gpio_cfg &= ~BIT(TALKMAN_GP_OE_BIT);
+	writel_relaxed(gpio_cfg, talkman_tlmm + TALKMAN_GP_CFG(scl_gpio));
+	wmb();
+	udelay(BB_HALF_US);
+
+	if (!talkman_pad_in(sda_gpio) || !talkman_pad_in(scl_gpio)) {
+		rc = -EBUSY;
+		goto restore;
+	}
+	/* START */
+	talkman_pad_drive_low(sda_gpio, true);
+	udelay(BB_HALF_US);
+	talkman_pad_drive_low(scl_gpio, true);
+	udelay(BB_HALF_US);
+
+	rc = bb_write_byte(sda_gpio, scl_gpio, addr7 << 1);
+	for (i = 0; !rc && i < len; i++)
+		rc = bb_write_byte(sda_gpio, scl_gpio, data[i]);
+
+	/* STOP (also after a NAK, so the slave is left idle) */
+	talkman_pad_drive_low(sda_gpio, true);
+	udelay(BB_HALF_US);
+	bb_scl_high(scl_gpio);
+	udelay(BB_HALF_US);
+	talkman_pad_drive_low(sda_gpio, false);
+	udelay(BB_HALF_US);
+	if (rc)
+		pr_info("%s: SDA%u/SCL%u addr 0x%02x len %u rc=%d at byte %u\n",
+			__func__, sda_gpio, scl_gpio, addr7, len, rc, i);
+restore:
+	writel_relaxed(sda_cfg, talkman_tlmm + TALKMAN_GP_CFG(sda_gpio));
+	writel_relaxed(scl_cfg, talkman_tlmm + TALKMAN_GP_CFG(scl_gpio));
+	wmb();
+	return rc;
+}
+EXPORT_SYMBOL(msm_cam_talkman_i2c_bitbang_write);
+
 void msm_camera_io_w(u32 data, void __iomem *addr)
 {
 	CDBG("%s: 0x%pK %08x\n", __func__,  (addr), (data));
