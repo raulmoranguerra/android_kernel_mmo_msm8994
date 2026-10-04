@@ -442,10 +442,27 @@ static const struct file_operations scan_fops = {
 
 /* ---- held power + raw CCI access ---------------------------------- */
 
+/*
+ * "attach": share the CCI bus with a running camera session without
+ * touching rails, clocks or pins (holding them re-programs MCLK0 and the
+ * pads under the sensor driver and stalls the stream). Lets the i2c/ois
+ * lab commands talk to the BU24210 while the rear camera streams.
+ */
+static bool scan_attached;
+
 static void scan_hold_off(struct talkman_cci_scan *s)
 {
 	if (!s->held)
 		return;
+	if (scan_attached) {
+		scan_cci_release(&s->held_client, s->held_cci, s->held_inits);
+		s->held_cci = NULL;
+		s->held_inits = 0;
+		s->held = 0;
+		scan_attached = false;
+		scan_append(s, "detached\n");
+		return;
+	}
 	if (s->held == 1)
 		scan_power_rear(s, false);
 	else
@@ -514,7 +531,18 @@ static ssize_t power_write(struct file *file, const char __user *ubuf,
 		rc = scan_hold_on(s, 2);
 	else if (!strcmp(cmd, "off") || !strcmp(cmd, "0"))
 		scan_hold_off(s);
-	else
+	else if (!strcmp(cmd, "attach")) {
+		if (s->held)
+			scan_hold_off(s);
+		rc = scan_cci_init(s, &s->held_client, &s->held_cci);
+		if (rc >= 0) {
+			s->held_inits = rc;
+			s->held = 1;
+			scan_attached = true;
+			scan_append(s, "attached to CCI (no power/clock/pin changes)\n");
+			rc = 0;
+		}
+	} else
 		rc = -EINVAL;
 	mutex_unlock(&s->lock);
 	return rc ? rc : count;
