@@ -12,7 +12,7 @@
  * Iris (disabled): CCI0, CAM_MCLK1 GPIO 14, IRIS_CAM_RES_N GPIO 102.
  *
  * Rear qcom,slave-id is the on-device CCI1 ACK (write 0x20, id 0x0230).
- * No OIS node. Do not use cam_sensor_rear2 (GPIO 94 = NFC DWL).
+ * No OIS node (AF only). Do not use cam_sensor_rear2 (GPIO 94 = NFC DWL).
  */
 
 &soc {
@@ -80,6 +80,28 @@
 	pinctrl-0 = <&cci0_active &cci1_active>;
 	pinctrl-1 = <&cci0_suspend &cci1_suspend>;
 
+	/*
+	 * Rear AF: ROHM BU24210 on CCI1 (Carrera DCC 0AEACA05: device 0x7c,
+	 * focus register 0x05F0). clark asks for an LC898212; msm_actuator
+	 * drives the BU24210 instead ("mmo,bu24210") and decodes clark's
+	 * set_info layout ("mmo,moto-actuator-abi"). Range from an on-device
+	 * sharpness sweep 2026-10-04: infinity ~920, ~10 cm ~1100.
+	 */
+	actuator0: qcom,actuator@0 {
+		cell-index = <0>;
+		reg = <0x0>;
+		compatible = "qcom,actuator";
+		qcom,cci-master = <1>;
+		cam_vaf-supply = <&pm8994_l23>;
+		qcom,cam-vreg-name = "cam_vaf";
+		qcom,cam-vreg-min-voltage = <2850000>;
+		qcom,cam-vreg-max-voltage = <2850000>;
+		qcom,cam-vreg-op-mode = <100000>;
+		mmo,bu24210;
+		mmo,bu24210-range = <880 1150>;
+		mmo,moto-actuator-abi;
+	};
+
 	qcom,camera@0 {
 		cell-index = <0>;
 		compatible = "qcom,camera";
@@ -137,6 +159,7 @@
 		qcom,cam-power-seq-cfg-val = <1 1 1 1 24000000>;
 		qcom,cam-power-seq-delay = <1 1 1 1 5>;
 		qcom,led-flash-src = <&led_flash0>;
+		qcom,actuator-src = <&actuator0>;
 		qcom,sensor-position = <0>;
 		qcom,sensor-mode = <0>;
 		qcom,cci-master = <1>;

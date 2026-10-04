@@ -105,6 +105,11 @@ struct msm_actuator_ctrl_t {
 	struct msm_actuator_vreg vreg_cfg;
 	struct park_lens_data_t park_lens;
 	uint32_t max_code_size;
+	/* talkman: Motorola userspace ABI, BU24210 code range (DT mmo,*) */
+	bool mot_abi;
+	bool bu24210;
+	uint16_t bu_inf;
+	uint16_t bu_macro;
 };
 
 #endif

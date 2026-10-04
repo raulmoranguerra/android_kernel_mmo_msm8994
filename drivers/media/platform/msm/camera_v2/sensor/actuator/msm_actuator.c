@@ -36,6 +36,16 @@ static struct msm_actuator msm_vcm_actuator_table;
 static struct msm_actuator msm_piezo_actuator_table;
 static struct msm_actuator msm_hvcm_actuator_table;
 static struct msm_actuator msm_bivcm_actuator_table;
+static struct msm_actuator msm_bu24210_actuator_table;
+
+/*
+ * talkman rear AF range override for tuning on the phone, in BU24210
+ * codes; 0 = DT mmo,bu24210-range. Read at the next camera open.
+ */
+static uint bu24210_inf;
+module_param(bu24210_inf, uint, 0644);
+static uint bu24210_macro;
+module_param(bu24210_macro, uint, 0644);
 
 static struct i2c_driver msm_actuator_i2c_driver;
 static struct msm_actuator *actuators[] = {
@@ -1147,6 +1157,242 @@ static int32_t msm_actuator_bivcm_set_position(
 	return rc;
 }
 
+/*
+ * talkman (Lumia 950) rear AF: ROHM BU24210 OIS/AF controller on CCI1
+ * (Carrera module DCC 0AEACA05: device 0x7c, focus register 0x05F0).
+ * The clark userspace asks for an LC898212 HVCM (act_type 4, 0xe4); its
+ * init settings and DAC codes do not apply here. The AF algorithm's step
+ * index is mapped linearly onto the BU24210 code range from DT
+ * (mmo,bu24210-range = <infinity macro>, larger code = nearer).
+ * Enable: 0x0520 = 1, wait for 0x0524 != 0. Move: pos hi, pos lo, 0x02,
+ * 0x01 to 0x05F0..0x05F3; 0x05F3 bit0 is busy (~15-25 ms on device).
+ * The target is 11 bits; code 0 leaves the lens on its stop.
+ */
+#define BU24210_SID		0x3e
+#define BU24210_MODE		0x0520
+#define BU24210_READY		0x0524
+#define BU24210_AF_POS		0x05F0
+#define BU24210_AF_GO		0x05F3
+#define BU24210_CODE_MAX	2047
+#define BU24210_PARK_STEP	48
+
+static int32_t msm_actuator_bu24210_read(struct msm_actuator_ctrl_t *a_ctrl,
+	uint16_t reg, uint16_t *val)
+{
+	return a_ctrl->i2c_client.i2c_func_tbl->i2c_read(&a_ctrl->i2c_client,
+		reg, val, MSM_CAMERA_I2C_BYTE_DATA);
+}
+
+static int32_t msm_actuator_bu24210_write_code(
+	struct msm_actuator_ctrl_t *a_ctrl, uint16_t code)
+{
+	struct msm_camera_i2c_reg_array regs[] = {
+		{ BU24210_AF_POS, code >> 8, 0 },
+		{ BU24210_AF_POS + 1, code & 0xff, 0 },
+		{ BU24210_AF_POS + 2, 0x02, 0 },
+		{ BU24210_AF_GO, 0x01, 0 },
+	};
+	struct msm_camera_i2c_reg_setting reg_setting = {
+		.reg_setting = regs,
+		.size = ARRAY_SIZE(regs),
+		.addr_type = MSM_CAMERA_I2C_WORD_ADDR,
+		.data_type = MSM_CAMERA_I2C_BYTE_DATA,
+		.delay = 0,
+	};
+	uint16_t busy = 0;
+	int32_t rc, i;
+
+	rc = a_ctrl->i2c_client.i2c_func_tbl->i2c_write_table(
+		&a_ctrl->i2c_client, &reg_setting);
+	if (rc < 0) {
+		pr_err("bu24210: move to %u failed %d\n", code, rc);
+		return rc;
+	}
+	for (i = 0; i < 25; i++) {
+		usleep_range(2000, 2500);
+		rc = msm_actuator_bu24210_read(a_ctrl, BU24210_AF_GO, &busy);
+		if (rc < 0 || !(busy & 0x01))
+			break;
+	}
+	if (rc < 0 || (busy & 0x01))
+		pr_err_ratelimited("bu24210: move to %u busy 0x%x rc %d\n",
+			code, busy, rc);
+	return rc < 0 ? rc : 0;
+}
+
+static int32_t msm_actuator_bu24210_init_focus(
+	struct msm_actuator_ctrl_t *a_ctrl, uint16_t size,
+	struct reg_settings_t *settings)
+{
+	uint16_t ready = 0;
+	int32_t rc, i;
+
+	rc = a_ctrl->i2c_client.i2c_func_tbl->i2c_write(&a_ctrl->i2c_client,
+		BU24210_MODE, 0x01, MSM_CAMERA_I2C_BYTE_DATA);
+	if (rc < 0) {
+		pr_err("bu24210: enable failed %d\n", rc);
+		return rc;
+	}
+	for (i = 0; i < 100; i++) {
+		rc = msm_actuator_bu24210_read(a_ctrl, BU24210_READY, &ready);
+		if (rc < 0 || ready)
+			break;
+		usleep_range(1000, 1100);
+	}
+	if (rc < 0 || !ready) {
+		pr_err("bu24210: not ready 0x%x rc %d\n", ready, rc);
+		return rc < 0 ? rc : -ETIMEDOUT;
+	}
+	a_ctrl->curr_step_pos = 0;
+	return 0;
+}
+
+static int32_t msm_actuator_bu24210_init_step_table(
+	struct msm_actuator_ctrl_t *a_ctrl,
+	struct msm_actuator_set_info_t *set_info)
+{
+	uint32_t total_steps = set_info->af_tuning_params.total_steps;
+	uint32_t inf = bu24210_inf ? bu24210_inf : a_ctrl->bu_inf;
+	uint32_t macro = bu24210_macro ? bu24210_macro : a_ctrl->bu_macro;
+	uint32_t i;
+
+	if (a_ctrl->actuator_state != ACT_OPS_ACTIVE) {
+		pr_err("%s:%d invalid actuator_state %d\n"
+			, __func__, __LINE__, a_ctrl->actuator_state);
+		return -EINVAL;
+	}
+	if (!total_steps || total_steps > MAX_ACTUATOR_AF_TOTAL_STEPS) {
+		pr_err("bu24210: invalid total_steps %u\n", total_steps);
+		return -EFAULT;
+	}
+	if (inf >= macro || macro > BU24210_CODE_MAX) {
+		pr_err("bu24210: invalid range %u..%u\n", inf, macro);
+		return -EINVAL;
+	}
+
+	kfree(a_ctrl->step_position_table);
+	a_ctrl->step_position_table =
+		kzalloc(sizeof(uint16_t) * (total_steps + 1), GFP_KERNEL);
+	if (a_ctrl->step_position_table == NULL)
+		return -ENOMEM;
+	for (i = 0; i <= total_steps; i++)
+		a_ctrl->step_position_table[i] =
+			inf + (macro - inf) * i / total_steps;
+
+	a_ctrl->total_steps = total_steps;
+	a_ctrl->max_code_size = BU24210_CODE_MAX + 1;
+	pr_info("bu24210: %u steps over codes %u..%u\n",
+		total_steps, inf, macro);
+	return 0;
+}
+
+static int32_t msm_actuator_bu24210_move_focus(
+	struct msm_actuator_ctrl_t *a_ctrl,
+	struct msm_actuator_move_params_t *move_params)
+{
+	int16_t dest_step_pos = move_params->dest_step_pos;
+	int32_t rc;
+
+	if (a_ctrl->step_position_table == NULL) {
+		pr_err("Step Position Table is NULL");
+		return -EFAULT;
+	}
+	if (dest_step_pos < 0 || dest_step_pos > a_ctrl->total_steps) {
+		pr_err("bu24210: step %d out of 0..%u\n",
+			dest_step_pos, a_ctrl->total_steps);
+		return -EFAULT;
+	}
+	CDBG("bu24210: step %d -> %d code %u\n", a_ctrl->curr_step_pos,
+		dest_step_pos, a_ctrl->step_position_table[dest_step_pos]);
+
+	if (dest_step_pos != a_ctrl->curr_step_pos) {
+		rc = msm_actuator_bu24210_write_code(a_ctrl,
+			a_ctrl->step_position_table[dest_step_pos]);
+		if (rc < 0)
+			return rc;
+		a_ctrl->curr_step_pos = dest_step_pos;
+	}
+	move_params->curr_lens_pos =
+		a_ctrl->step_position_table[dest_step_pos];
+	return 0;
+}
+
+static int32_t msm_actuator_bu24210_set_position(
+	struct msm_actuator_ctrl_t *a_ctrl,
+	struct msm_actuator_set_position_t *set_pos)
+{
+	/* Positions are LC898212 DAC codes from the clark library. */
+	pr_info_ratelimited("bu24210: set_position (%u entries) ignored\n",
+		set_pos->number_of_steps);
+	return 0;
+}
+
+/* Ease the lens back onto its stop so it does not drop when VAF goes. */
+static int32_t msm_actuator_bu24210_park_lens(
+	struct msm_actuator_ctrl_t *a_ctrl)
+{
+	uint16_t code;
+	int32_t rc = 0;
+
+	if (a_ctrl->step_position_table == NULL ||
+		a_ctrl->curr_step_pos < 0 ||
+		a_ctrl->curr_step_pos > a_ctrl->total_steps)
+		return 0;
+
+	code = a_ctrl->step_position_table[a_ctrl->curr_step_pos];
+	while (code && rc >= 0) {
+		code = code > BU24210_PARK_STEP ? code - BU24210_PARK_STEP : 0;
+		rc = msm_actuator_bu24210_write_code(a_ctrl, code);
+	}
+	a_ctrl->curr_step_pos = 0;
+	return rc;
+}
+
+static int32_t msm_actuator_bu24210_set_param(
+	struct msm_actuator_ctrl_t *a_ctrl,
+	struct msm_actuator_set_info_t *set_info)
+{
+	struct msm_camera_cci_client *cci_client =
+		a_ctrl->i2c_client.cci_client;
+	int32_t rc;
+
+	pr_info("bu24210: library act_type %d addr 0x%x steps %u regions %u initial %d\n",
+		set_info->actuator_params.act_type,
+		set_info->actuator_params.i2c_addr,
+		set_info->af_tuning_params.total_steps,
+		set_info->af_tuning_params.region_size,
+		set_info->af_tuning_params.initial_code);
+
+	if (a_ctrl->act_device_type != MSM_CAMERA_PLATFORM_DEVICE)
+		return -EINVAL;
+
+	a_ctrl->func_tbl = &msm_bu24210_actuator_table.func_tbl;
+	cci_client->sid = BU24210_SID;
+	cci_client->retries = 3;
+	cci_client->id_map = 0;
+	cci_client->cci_i2c_master = a_ctrl->cci_master;
+	a_ctrl->i2c_client.addr_type = MSM_CAMERA_I2C_WORD_ADDR;
+	a_ctrl->i2c_data_type = MSM_ACTUATOR_BYTE_DATA;
+	a_ctrl->region_size = 0;
+	a_ctrl->reg_tbl_size = 0;
+	a_ctrl->pwd_step = set_info->af_tuning_params.pwd_step;
+	a_ctrl->park_lens = set_info->actuator_params.park_lens;
+	a_ctrl->initial_code = set_info->af_tuning_params.initial_code;
+
+	rc = a_ctrl->func_tbl->actuator_init_step_table(a_ctrl, set_info);
+	if (rc < 0)
+		return rc;
+	rc = a_ctrl->func_tbl->actuator_init_focus(a_ctrl, 0, NULL);
+	if (rc < 0)
+		return rc;
+	/* The lens sits on its stop after power-up: lift it to step 0. */
+	rc = msm_actuator_bu24210_write_code(a_ctrl,
+		a_ctrl->step_position_table[0]);
+	a_ctrl->curr_step_pos = 0;
+	a_ctrl->curr_region_index = 0;
+	return rc;
+}
+
 static int32_t msm_actuator_set_param(struct msm_actuator_ctrl_t *a_ctrl,
 	struct msm_actuator_set_info_t *set_info) {
 	struct reg_settings_t *init_settings = NULL;
@@ -1154,6 +1400,9 @@ static int32_t msm_actuator_set_param(struct msm_actuator_ctrl_t *a_ctrl,
 	uint16_t i = 0;
 	struct msm_camera_cci_client *cci_client = NULL;
 	CDBG("Enter\n");
+
+	if (a_ctrl->bu24210)
+		return msm_actuator_bu24210_set_param(a_ctrl, set_info);
 
 	for (i = 0; i < ARRAY_SIZE(actuators); i++) {
 		if (set_info->actuator_params.act_type ==
@@ -1483,6 +1732,70 @@ static long msm_actuator_subdev_ioctl(struct v4l2_subdev *sd,
 }
 
 #ifdef CONFIG_COMPAT
+/*
+ * Motorola clark userspace (32-bit) msm_actuator_set_info_t: adds
+ * power_off_setting_size (in the padding), a power_off_settings pointer
+ * before park_lens (park_lens and af_tuning_params move by 4) and the
+ * module's infinity/macro DAC calibration at the end.
+ */
+struct msm_actuator_mot_params_t32 {
+	enum actuator_type act_type;
+	uint8_t reg_tbl_size;
+	uint16_t data_size;
+	uint16_t init_setting_size;
+	uint16_t power_off_setting_size;
+	uint32_t i2c_addr;
+	enum msm_actuator_addr_type i2c_addr_type;
+	enum msm_actuator_data_type i2c_data_type;
+	compat_uptr_t reg_tbl_params;
+	compat_uptr_t init_settings;
+	compat_uptr_t power_off_settings;
+	struct park_lens_data_t park_lens;
+};
+
+struct msm_actuator_mot_set_info_t32 {
+	struct msm_actuator_mot_params_t32 actuator_params;
+	struct msm_actuator_tuning_params_t32 af_tuning_params;
+	int16_t infinity_dac;
+	int16_t macro_dac;
+};
+
+static void msm_actuator_mot_set_info32(struct msm_actuator_cfg_data *dst,
+	struct msm_actuator_cfg_data32 *src)
+{
+	struct msm_actuator_mot_set_info_t32 *mot =
+		(struct msm_actuator_mot_set_info_t32 *)&src->cfg.set_info;
+	struct msm_actuator_params_t *params =
+		&dst->cfg.set_info.actuator_params;
+	struct msm_actuator_tuning_params_t *tuning =
+		&dst->cfg.set_info.af_tuning_params;
+
+	BUILD_BUG_ON(sizeof(struct msm_actuator_mot_set_info_t32) != 72);
+	BUILD_BUG_ON(sizeof(struct msm_actuator_mot_set_info_t32) >
+		sizeof(src->cfg));
+
+	dst->cfgtype = src->cfgtype;
+	dst->is_af_supported = src->is_af_supported;
+	params->act_type = mot->actuator_params.act_type;
+	params->reg_tbl_size = mot->actuator_params.reg_tbl_size;
+	params->data_size = mot->actuator_params.data_size;
+	params->init_setting_size = mot->actuator_params.init_setting_size;
+	params->i2c_addr = mot->actuator_params.i2c_addr;
+	params->i2c_addr_type = mot->actuator_params.i2c_addr_type;
+	params->i2c_data_type = mot->actuator_params.i2c_data_type;
+	params->reg_tbl_params =
+		compat_ptr(mot->actuator_params.reg_tbl_params);
+	params->init_settings = compat_ptr(mot->actuator_params.init_settings);
+	params->park_lens = mot->actuator_params.park_lens;
+	tuning->initial_code = mot->af_tuning_params.initial_code;
+	tuning->pwd_step = mot->af_tuning_params.pwd_step;
+	tuning->region_size = mot->af_tuning_params.region_size;
+	tuning->total_steps = mot->af_tuning_params.total_steps;
+	tuning->region_params = compat_ptr(mot->af_tuning_params.region_params);
+	pr_info("mot: infinity_dac %d macro_dac %d\n",
+		mot->infinity_dac, mot->macro_dac);
+}
+
 static long msm_actuator_subdev_do_ioctl(
 	struct file *file, unsigned int cmd, void *arg)
 {
@@ -1491,6 +1804,7 @@ static long msm_actuator_subdev_do_ioctl(
 	struct msm_actuator_cfg_data32 *u32 =
 		(struct msm_actuator_cfg_data32 *)arg;
 	struct msm_actuator_cfg_data actuator_data;
+	struct msm_actuator_ctrl_t *a_ctrl = v4l2_get_subdevdata(sd);
 	void *parg = arg;
 	long rc;
 
@@ -1498,6 +1812,12 @@ static long msm_actuator_subdev_do_ioctl(
 	case VIDIOC_MSM_ACTUATOR_CFG32:
 		switch (u32->cfgtype) {
 		case CFG_SET_ACTUATOR_INFO:
+			if (a_ctrl->mot_abi) {
+				msm_actuator_mot_set_info32(&actuator_data,
+					u32);
+				parg = &actuator_data;
+				break;
+			}
 			actuator_data.cfgtype = u32->cfgtype;
 			actuator_data.is_af_supported = u32->is_af_supported;
 			actuator_data.cfg.set_info.actuator_params.act_type =
@@ -1800,6 +2120,26 @@ static int32_t msm_actuator_platform_probe(struct platform_device *pdev)
 		}
 	}
 
+	/* talkman: see msm_actuator_bu24210_set_param() */
+	msm_actuator_t->mot_abi = of_property_read_bool(pdev->dev.of_node,
+		"mmo,moto-actuator-abi");
+	if (of_property_read_bool(pdev->dev.of_node, "mmo,bu24210")) {
+		u32 range[2];
+
+		rc = of_property_read_u32_array(pdev->dev.of_node,
+			"mmo,bu24210-range", range, ARRAY_SIZE(range));
+		if (rc < 0 || range[0] >= range[1] ||
+			range[1] > BU24210_CODE_MAX) {
+			pr_err("invalid mmo,bu24210-range rc %d\n", rc);
+			kfree(msm_actuator_t->vreg_cfg.cam_vreg);
+			kfree(msm_actuator_t);
+			return -EINVAL;
+		}
+		msm_actuator_t->bu24210 = true;
+		msm_actuator_t->bu_inf = range[0];
+		msm_actuator_t->bu_macro = range[1];
+	}
+
 	msm_actuator_t->act_v4l2_subdev_ops = &msm_actuator_subdev_ops;
 	msm_actuator_t->actuator_mutex = &msm_actuator_mutex;
 	msm_actuator_t->cam_name = pdev->id;
@@ -1945,6 +2285,21 @@ static struct msm_actuator msm_bivcm_actuator_table = {
 		.actuator_parse_i2c_params = NULL,
 		.actuator_set_position = msm_actuator_bivcm_set_position,
 		.actuator_park_lens = NULL,
+	},
+};
+
+static struct msm_actuator msm_bu24210_actuator_table = {
+	.act_type = ACTUATOR_VCM,
+	.func_tbl = {
+		.actuator_init_step_table =
+			msm_actuator_bu24210_init_step_table,
+		.actuator_move_focus = msm_actuator_bu24210_move_focus,
+		.actuator_write_focus = NULL,
+		.actuator_set_default_focus = msm_actuator_set_default_focus,
+		.actuator_init_focus = msm_actuator_bu24210_init_focus,
+		.actuator_parse_i2c_params = NULL,
+		.actuator_set_position = msm_actuator_bu24210_set_position,
+		.actuator_park_lens = msm_actuator_bu24210_park_lens,
 	},
 };
 
