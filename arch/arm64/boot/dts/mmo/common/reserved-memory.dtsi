@@ -3,11 +3,20 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 
-		ramoops_mem: ramoops_region@0 {
+		/*
+		 * 2 MiB taken out of System RAM (0x0ea00000-0x5fffffff) for
+		 * pstore. The old 1 MiB region at 0x070A0000 sat in the removed
+		 * 0x06400000-0x071fffff hole while the 2 MiB buffer crossed
+		 * into System RAM at 0x07200000, so ramoops never registered
+		 * ("failed to request mem region"), and CMA rounded it onto
+		 * modem_mem at 0x07400000. remove-completely keeps the base
+		 * exact and maps the buffer as I/O memory.
+		 */
+		ramoops_mem: ramoops_region@1fe00000 {
 			linux,reserve-contiguous-region;
 			linux,reserve-region;
-			reg = <0 0x070A0000 0 0x00100000>;
-			//linux,remove-completely;
+			linux,remove-completely;
+			reg = <0 0x1fe00000 0 0x00200000>;
 			label = "ramoops_mem";
 		};
 	};
@@ -18,14 +27,13 @@
 		compatible = "ramoops";
 		status = "ok";
 
-		android,ramoops-buffer-start = <0x070A0000>;
+		android,ramoops-buffer-start = <0x1fe00000>;
 		android,ramoops-buffer-size = <0x200000>;
 		android,ramoops-console-size = <0x100000>;
 		android,ramoops-record-size = <0x10000>;
 		android,ramoops-ftrace-size = <0x10000>;
 		android,ramoops-pmsg-size = <0x80000>;
 		android,ramoops-dump-oops = <0x1>;
-		linux,contiguous-region = <&ramoops_mem>;
 	};
 };
 

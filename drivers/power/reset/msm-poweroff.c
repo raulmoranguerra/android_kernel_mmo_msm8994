@@ -46,6 +46,16 @@
 
 static int restart_mode;
 void *restart_reason;
+
+/*
+ * Keep RAM across crash resets so ramoops survives: a normal restart hard
+ * resets the PMIC, which clears DDR. A panic restart resets warm instead,
+ * and PS_HOLD is set to warm reset at boot for resets that bypass
+ * msm_restart (TZ watchdog bite, msm_thermal reset). Plain reboots still
+ * hard reset.
+ */
+static bool warm_crash_reset = true;
+module_param(warm_crash_reset, bool, 0644);
 static bool scm_pmic_arbiter_disable_supported;
 static bool scm_deassert_ps_hold_supported;
 /* Download mode master kill-switch */
@@ -247,6 +257,10 @@ static void msm_restart_prepare(const char *cmd)
 
 #ifdef CONFIG_MSM_PRESERVE_MEM
 	need_warm_reset = true;
+#endif
+#ifdef CONFIG_MSM_DLOAD_MODE
+	if (in_panic && warm_crash_reset)
+		need_warm_reset = true;
 #endif
 
 	/* Hard reset the PMIC unless memory contents must be maintained. */
@@ -487,3 +501,11 @@ static int __init msm_restart_init(void)
 	return platform_driver_register(&msm_restart_driver);
 }
 device_initcall(msm_restart_init);
+
+static int __init msm_restart_warm_crash_init(void)
+{
+	if (!warm_crash_reset)
+		return 0;
+	return qpnp_pon_system_pwr_off(PON_POWER_OFF_WARM_RESET);
+}
+late_initcall(msm_restart_warm_crash_init);
