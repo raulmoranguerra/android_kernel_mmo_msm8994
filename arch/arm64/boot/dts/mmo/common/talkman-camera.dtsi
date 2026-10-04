@@ -319,10 +319,26 @@
 			"csi_ahb_clk", "csi_rdi_clk",
 			"csi_pix_clk", "camss_ahb_clk";
 	};
+	/*
+	 * Iris camera: CSIPHY2 combo mode, second port. msm_csiphy_lane_config
+	 * points the PHY2 clock mux's second port at CSID3 (csid_core << 4),
+	 * which needs CSID3's PHY clock; the CAF tree only gives PHY2 csi2phy,
+	 * so without camss_csi3phy_clk CSID3 sees no packets.
+	 */
 	qcom,csid@fda08c00 {
+		clocks = <&clock_mmss clk_camss_top_ahb_clk>,
+			<&clock_mmss clk_camss_ispif_ahb_clk>,
+			<&clock_mmss clk_csi3_clk_src>,
+			<&clock_mmss clk_camss_csi3_clk>,
+			<&clock_mmss clk_camss_csi3_ahb_clk>,
+			<&clock_mmss clk_camss_csi3rdi_clk>,
+			<&clock_mmss clk_camss_csi3pix_clk>,
+			<&clock_mmss clk_camss_ahb_clk>,
+			<&clock_mmss clk_camss_csi3phy_clk>;
 		clock-names = "camss_top_ahb_clk",
 			"ispif_ahb_clk", "csi_src_clk", "csi_clk",
 			"csi_ahb_clk", "csi_rdi_clk",
-			"csi_pix_clk", "camss_ahb_clk";
+			"csi_pix_clk", "camss_ahb_clk", "csi_phy_clk";
+		qcom,clock-rates = <0 0 266670000 0 0 0 0 0 0>;
 	};
 };
