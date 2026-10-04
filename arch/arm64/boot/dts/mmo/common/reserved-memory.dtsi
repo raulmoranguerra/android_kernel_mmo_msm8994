@@ -4,19 +4,23 @@
 		#size-cells = <2>;
 
 		/*
-		 * 2 MiB taken out of System RAM (0x0ea00000-0x5fffffff) for
-		 * pstore. The old 1 MiB region at 0x070A0000 sat in the removed
+		 * 2 MiB taken out of System RAM for pstore. The Lumia boot
+		 * chain (SBL, UEFI, bootshim, lk2nd) zeroes nearly all RAM on
+		 * a warm reset; canaries (talkman_memprobe, in the
+		 * lumia950-android repo) survived only in about
+		 * 0xc6000000-0xca400000, so the log goes there. The old 1 MiB
+		 * region at 0x070A0000 sat in the removed
 		 * 0x06400000-0x071fffff hole while the 2 MiB buffer crossed
 		 * into System RAM at 0x07200000, so ramoops never registered
 		 * ("failed to request mem region"), and CMA rounded it onto
 		 * modem_mem at 0x07400000. remove-completely keeps the base
 		 * exact and maps the buffer as I/O memory.
 		 */
-		ramoops_mem: ramoops_region@1fe00000 {
+		ramoops_mem: ramoops_region@c8000000 {
 			linux,reserve-contiguous-region;
 			linux,reserve-region;
 			linux,remove-completely;
-			reg = <0 0x1fe00000 0 0x00200000>;
+			reg = <0 0xc8000000 0 0x00200000>;
 			label = "ramoops_mem";
 		};
 	};
@@ -27,7 +31,7 @@
 		compatible = "ramoops";
 		status = "ok";
 
-		android,ramoops-buffer-start = <0x1fe00000>;
+		android,ramoops-buffer-start = <0xc8000000>;
 		android,ramoops-buffer-size = <0x200000>;
 		android,ramoops-console-size = <0x100000>;
 		android,ramoops-record-size = <0x10000>;
