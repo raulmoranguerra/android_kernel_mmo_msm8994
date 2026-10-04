@@ -34,22 +34,35 @@
 		cam_vaf-supply = <&pm8994_l23>;
 		cam_vio-supply = <&pm8994_lvs1>;
 		cam_vana_front-supply = <&pm8994_l17>;
+		/* Iris digital core, Windows \_SB.CAMT L3 1.2 V. */
+		cam_vdig_iris-supply = <&pm8994_l3>;
 		clocks = <&clock_mmss clk_mclk0_clk_src>,
 			<&clock_mmss clk_camss_mclk0_clk>,
 			<&clock_mmss clk_mclk2_clk_src>,
-			<&clock_mmss clk_camss_mclk2_clk>;
-		clock-names = "mclk0_src", "mclk0", "mclk2_src", "mclk2";
+			<&clock_mmss clk_camss_mclk2_clk>,
+			<&clock_mmss clk_mclk1_clk_src>,
+			<&clock_mmss clk_camss_mclk1_clk>;
+		clock-names = "mclk0_src", "mclk0", "mclk2_src", "mclk2",
+			"mclk1_src", "mclk1";
 		qcom,mclk-rate = <24000000>;
+		mmo,iris-mclk-rate = <9600000>;
+		/* IRIS_CAM_RES_N; camera@2 is disabled, so the scanner owns it
+		 * for the "iris" power mode. */
+		mmo,iris-reset-gpio = <&msm_gpio 102 0>;
 		/* No mmo,front-reset-gpio: camera@1 owns CAM_FRONT_RES_N
 		 * (GPIO 104), so the front sweep only sees the VD6955 while
 		 * a camera session holds it out of reset. */
 		pinctrl-names = "default", "scan";
 		pinctrl-0 = <&cam_sensor_mclk0_suspend
 			     &cam_sensor_mclk2_suspend
-			     &cam_sensor_front_rst_suspend>;
+			     &cam_sensor_front_rst_suspend
+			     &cam_sensor_mclk1_suspend
+			     &cam_sensor_iris_suspend>;
 		pinctrl-1 = <&cam_sensor_mclk0_active
 			     &cam_sensor_mclk2_active
-			     &cam_sensor_front_rst_active>;
+			     &cam_sensor_front_rst_active
+			     &cam_sensor_mclk1_active
+			     &cam_sensor_iris_active>;
 	};
 };
 
