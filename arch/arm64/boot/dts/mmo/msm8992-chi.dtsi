@@ -93,10 +93,27 @@
 
 &mdss_dsi0 {
 	qcom,dsi-pref-prim-pan = <&dsi_duke_wqhd_dsi0_cmd>;
+	/* Stock talkman leaves LAB/IBB to the regulator driver and runs the DSI PHY in DCDC mode. */
+	/delete-property/ qcom,dsi-panel-bias-vreg;
+	/delete-property/ qcom,regulator-ldo-mode;
 };
 
 &mdss_dsi1 {
 	qcom,dsi-pref-prim-pan = <&dsi_duke_wqhd_dsi1_cmd>;
+};
+
+/*
+ * Talkman's AMOLED rails come from the PMI8994 LAB/IBB in OLED mode, as on
+ * the stock (caf-stable) talkman tree. Mirror cityman's node; voltage limits
+ * are the shared PMI8994 defaults (4.6-6.0 V, init 5.5 V).
+ */
+&labibb {
+	status = "ok";
+	qpnp,qpnp-labibb-mode = "oled";
+};
+
+&ibb_regulator {
+	qcom,qpnp-ibb-discharge-resistor = <32>;
 };
 
 &usb3 {
