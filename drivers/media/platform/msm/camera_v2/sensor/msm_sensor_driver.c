@@ -591,6 +591,57 @@ static int32_t msm_sensor_get_power_settings(void *setting,
 	return rc;
 }
 
+/*
+ * A sensor library taken from another phone (Motorola clark
+ * libmmcamera_mot_imx230.so on talkman) carries that board's power
+ * sequence -- GPIO-switched rails, reset/standby lines -- and its slave
+ * address. A camera node with "mmo,dt-power-seq" keeps its own
+ * qcom,cam-power-seq-* sequence and qcom,slave-id instead, as long as the
+ * library probes for the same chip id.
+ */
+static int32_t msm_sensor_driver_use_dt_power(struct msm_sensor_ctrl_t *s_ctrl,
+	struct msm_camera_sensor_slave_info *slave_info)
+{
+	struct msm_camera_power_ctrl_t *power_info =
+		&s_ctrl->sensordata->power_info;
+	uint32_t id[3];
+	int32_t rc;
+
+	kfree(power_info->power_setting);
+	kfree(power_info->power_down_setting);
+	power_info->power_setting = NULL;
+	power_info->power_down_setting = NULL;
+	power_info->power_setting_size = 0;
+	power_info->power_down_setting_size = 0;
+
+	rc = msm_camera_get_dt_power_setting_data(s_ctrl->of_node,
+		power_info->cam_vreg, power_info->num_vreg, power_info);
+	if (rc < 0) {
+		pr_err("%s: %s: DT power sequence parse failed %d\n",
+			__func__, slave_info->sensor_name, rc);
+		return rc;
+	}
+
+	if (!of_property_read_u32_array(s_ctrl->of_node, "qcom,slave-id",
+			id, ARRAY_SIZE(id))) {
+		if (id[1] == slave_info->sensor_id_info.sensor_id_reg_addr &&
+		    id[2] == slave_info->sensor_id_info.sensor_id)
+			slave_info->slave_addr = id[0];
+		else
+			pr_warn("%s: %s: qcom,slave-id id 0x%x@0x%x does not match library 0x%x@0x%x, keeping 0x%x\n",
+				__func__, slave_info->sensor_name, id[2], id[1],
+				slave_info->sensor_id_info.sensor_id,
+				slave_info->sensor_id_info.sensor_id_reg_addr,
+				slave_info->slave_addr);
+	}
+
+	pr_info("%s: %s: DT power sequence (%d up, %d down), slave 0x%x\n",
+		__func__, slave_info->sensor_name,
+		power_info->power_setting_size,
+		power_info->power_down_setting_size, slave_info->slave_addr);
+	return 0;
+}
+
 static void msm_sensor_fill_sensor_info(struct msm_sensor_ctrl_t *s_ctrl,
 	struct msm_sensor_info_t *sensor_info, char *entity_name)
 {
@@ -802,6 +853,13 @@ int32_t msm_sensor_driver_probe(void *setting,
 	if (rc < 0) {
 		pr_err("failed");
 		goto free_slave_info;
+	}
+
+	if (s_ctrl->of_node &&
+		of_property_read_bool(s_ctrl->of_node, "mmo,dt-power-seq")) {
+		rc = msm_sensor_driver_use_dt_power(s_ctrl, slave_info);
+		if (rc < 0)
+			goto free_slave_info;
 	}
 
 
