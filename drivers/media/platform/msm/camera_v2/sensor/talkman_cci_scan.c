@@ -47,15 +47,20 @@ struct talkman_cci_scan {
 	struct regulator *vdig;
 	struct regulator *vio;
 	struct regulator *vana_front;
+	struct regulator *vdig_iris;	/* L3 1.2 V, optional */
 	struct clk *mclk0_src;
 	struct clk *mclk0;
 	struct clk *mclk2_src;
 	struct clk *mclk2;
+	struct clk *mclk1_src;		/* iris, optional */
+	struct clk *mclk1;
 	u32 mclk_rate;
+	u32 iris_mclk_rate;
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *pins_default;
 	struct pinctrl_state *pins_scan;
 	int front_rst_gpio;		/* CAM_FRONT_RES_N GPIO 104, -1 if absent */
+	int iris_rst_gpio;		/* IRIS_CAM_RES_N GPIO 102, -1 if absent */
 	struct dentry *dbg;
 	struct mutex lock;
 	char *buf;
@@ -65,7 +70,7 @@ struct talkman_cci_scan {
 	 * "i2c" can do raw reads/writes (BU24210 @ 0x7c probing, front
 	 * bring-up) without re-powering per transaction.
 	 */
-	int held;			/* 0 off, 1 rear, 2 front */
+	int held;			/* 0 off, 1 rear, 2 front, 3 iris */
 	int held_inits;
 	struct msm_camera_cci_client *held_cci;
 	struct msm_camera_i2c_client held_client;
@@ -238,6 +243,56 @@ err_vana:
 	return rc;
 }
 
+/*
+ * Iris (\_SB.CAMT in the Windows PEP table): L17 2.8 V, LVS1, L3 1.2 V,
+ * MCLK1 9.6 MHz on GPIO 14, then IRIS_CAM_RES_N (GPIO 102) high. The
+ * PMI8994 boost-bypass vote that comes first in Windows is left out; it
+ * is the IR LED supply.
+ */
+static int scan_power_iris(struct talkman_cci_scan *s, bool on)
+{
+	int rc;
+
+	if (!s->vdig_iris || !s->mclk1 || !gpio_is_valid(s->iris_rst_gpio))
+		return -ENODEV;
+	if (!on) {
+		gpio_set_value(s->iris_rst_gpio, 0);
+		scan_clk_off(s->mclk1_src, s->mclk1);
+		scan_power_rail(s->vdig_iris, false);
+		scan_power_rail(s->vio, false);
+		scan_power_rail(s->vana_front, false);
+		return 0;
+	}
+
+	rc = scan_power_rail(s->vana_front, true);
+	if (rc)
+		return rc;
+	rc = scan_power_rail(s->vio, true);
+	if (rc)
+		goto err_vana;
+	rc = scan_power_rail(s->vdig_iris, true);
+	if (rc)
+		goto err_vio;
+	usleep_range(1000, 1500);
+	rc = scan_clk_on(s->mclk1_src, s->mclk1, s->iris_mclk_rate);
+	if (rc)
+		goto err_vdig;
+	usleep_range(1000, 1500);
+	gpio_set_value(s->iris_rst_gpio, 1);
+	pr_info("%s: iris reset GPIO %d released\n", DRV_NAME,
+		s->iris_rst_gpio);
+	msleep(10);
+	return 0;
+
+err_vdig:
+	scan_power_rail(s->vdig_iris, false);
+err_vio:
+	scan_power_rail(s->vio, false);
+err_vana:
+	scan_power_rail(s->vana_front, false);
+	return rc;
+}
+
 static int scan_one_sid(struct talkman_cci_scan *s,
 			struct msm_camera_i2c_client *client,
 			u16 sid, const char *bus)
@@ -401,6 +456,20 @@ static int talkman_cci_do_scan(struct talkman_cci_scan *s)
 		scan_power_front(s, false);
 	}
 
+	rc = scan_power_iris(s, true);
+	if (rc) {
+		pr_err("%s: iris power-up rc=%d\n", DRV_NAME, rc);
+		scan_append(s, "iris power-up failed %d\n", rc);
+	} else {
+		scan_append(s, "iris CSI3 mclk1 %u Hz GPIO14 L17/L3:\n",
+			    s->iris_mclk_rate);
+		found += scan_master(s, &client, MASTER_0,
+				     "cci0-master0-iris");
+		found += scan_master(s, &client, MASTER_1,
+				     "cci0-master1-iris");
+		scan_power_iris(s, false);
+	}
+
 	scan_pins(s, false);
 	scan_cci_release(&client, cci_client, inited);
 	scan_append(s, "done, %d ACK(s)\n", found);
@@ -465,8 +534,10 @@ static void scan_hold_off(struct talkman_cci_scan *s)
 	}
 	if (s->held == 1)
 		scan_power_rear(s, false);
-	else
+	else if (s->held == 2)
 		scan_power_front(s, false);
+	else
+		scan_power_iris(s, false);
 	scan_pins(s, false);
 	scan_cci_release(&s->held_client, s->held_cci, s->held_inits);
 	s->held_cci = NULL;
@@ -475,6 +546,8 @@ static void scan_hold_off(struct talkman_cci_scan *s)
 	pr_info("%s: power off\n", DRV_NAME);
 	scan_append(s, "power off\n");
 }
+
+static const char * const which_name[] = { "off", "rear", "front", "iris" };
 
 static int scan_hold_on(struct talkman_cci_scan *s, int which)
 {
@@ -488,12 +561,13 @@ static int scan_hold_on(struct talkman_cci_scan *s, int which)
 		return rc;
 	s->held_inits = rc;
 	scan_pins(s, true);
-	rc = which == 1 ? scan_power_rear(s, true) : scan_power_front(s, true);
+	rc = which == 1 ? scan_power_rear(s, true) :
+	     which == 2 ? scan_power_front(s, true) : scan_power_iris(s, true);
 	if (rc) {
 		pr_err("%s: %s power-up rc=%d\n", DRV_NAME,
-		       which == 1 ? "rear" : "front", rc);
+		       which_name[which], rc);
 		scan_append(s, "%s power-up failed %d\n",
-			    which == 1 ? "rear" : "front", rc);
+			    which_name[which], rc);
 		scan_pins(s, false);
 		scan_cci_release(&s->held_client, s->held_cci, s->held_inits);
 		s->held_cci = NULL;
@@ -503,8 +577,9 @@ static int scan_hold_on(struct talkman_cci_scan *s, int which)
 	s->held = which;
 	pr_info("%s: power held: %s\n", DRV_NAME,
 		which == 1 ? "rear (L25/L29/L23 VAF, mclk0)" :
-			     "front (L17, mclk2, GPIO104 released)");
-	scan_append(s, "power held: %s\n", which == 1 ? "rear" : "front");
+		which == 2 ? "front (L17, mclk2, GPIO104 released)" :
+			     "iris (L17/L3, mclk1, GPIO102 released)");
+	scan_append(s, "power held: %s\n", which_name[which]);
 	return 0;
 }
 
@@ -529,6 +604,8 @@ static ssize_t power_write(struct file *file, const char __user *ubuf,
 		rc = scan_hold_on(s, 1);
 	else if (!strcmp(cmd, "front") || !strcmp(cmd, "2"))
 		rc = scan_hold_on(s, 2);
+	else if (!strcmp(cmd, "iris") || !strcmp(cmd, "3"))
+		rc = scan_hold_on(s, 3);
 	else if (!strcmp(cmd, "off") || !strcmp(cmd, "0"))
 		scan_hold_off(s);
 	else if (!strcmp(cmd, "attach")) {
@@ -1283,6 +1360,19 @@ static int talkman_cci_scan_probe(struct platform_device *pdev)
 	if (of_property_read_u32(np, "qcom,mclk-rate", &s->mclk_rate))
 		s->mclk_rate = 24000000;
 
+	/* Iris rail, clock and reset are optional (no "iris" power mode). */
+	s->vdig_iris = devm_regulator_get(&pdev->dev, "cam_vdig_iris");
+	if (IS_ERR(s->vdig_iris))
+		s->vdig_iris = NULL;
+	s->mclk1_src = devm_clk_get(&pdev->dev, "mclk1_src");
+	s->mclk1 = devm_clk_get(&pdev->dev, "mclk1");
+	if (IS_ERR(s->mclk1_src) || IS_ERR(s->mclk1)) {
+		s->mclk1_src = NULL;
+		s->mclk1 = NULL;
+	}
+	if (of_property_read_u32(np, "mmo,iris-mclk-rate", &s->iris_mclk_rate))
+		s->iris_mclk_rate = 9600000;
+
 	s->pinctrl = devm_pinctrl_get(&pdev->dev);
 	if (!IS_ERR(s->pinctrl)) {
 		s->pins_default = pinctrl_lookup_state(s->pinctrl,
@@ -1298,6 +1388,17 @@ static int talkman_cci_scan_probe(struct platform_device *pdev)
 			dev_warn(&pdev->dev, "front reset GPIO %d busy\n",
 				 s->front_rst_gpio);
 			s->front_rst_gpio = -1;
+		}
+	}
+
+	s->iris_rst_gpio = of_get_named_gpio(np, "mmo,iris-reset-gpio", 0);
+	if (gpio_is_valid(s->iris_rst_gpio)) {
+		if (devm_gpio_request_one(&pdev->dev, s->iris_rst_gpio,
+					  GPIOF_OUT_INIT_LOW,
+					  "IRIS_CAM_RES_N")) {
+			dev_warn(&pdev->dev, "iris reset GPIO %d busy\n",
+				 s->iris_rst_gpio);
+			s->iris_rst_gpio = -1;
 		}
 	}
 
@@ -1318,7 +1419,7 @@ static int talkman_cci_scan_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, s);
 	scan_append(s,
-		    "idle. echo 1 > scan | echo rear|front|off > power | "
+		    "idle. echo 1 > scan | echo rear|front|iris|off > power | "
 		    "echo 'r <m> <sid7> <reg> [alen] [dlen]' > i2c\n");
 	dev_info(&pdev->dev,
 		 "CCI scanner ready (mclk %u Hz). echo 1 > /sys/kernel/debug/%s/scan\n",
