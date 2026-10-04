@@ -1046,6 +1046,8 @@ int32_t msm_sensor_driver_probe(void *setting,
 	mount_pos = mount_pos | ((s_ctrl->sensordata->sensor_info->
 		sensor_mount_angle / 90) << 8);
 	s_ctrl->msm_sd.sd.entity.flags = mount_pos | MEDIA_ENT_FL_DEFAULT;
+	/* DT cell-index, so userspace can order cameras that share a facing */
+	s_ctrl->msm_sd.sd.entity.revision = s_ctrl->id;
 
 	/*Save sensor info*/
 	s_ctrl->sensordata->cam_slave_info = slave_info;
