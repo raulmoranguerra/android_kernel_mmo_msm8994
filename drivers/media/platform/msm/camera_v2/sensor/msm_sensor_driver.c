@@ -599,6 +599,39 @@ static int32_t msm_sensor_get_power_settings(void *setting,
  * qcom,cam-power-seq-* sequence and qcom,slave-id instead, as long as the
  * library probes for the same chip id.
  */
+/*
+ * msm_camera_get_dt_power_setting_data() stores a regulator step as its
+ * index in qcom,cam-vreg-name, but msm_camera_fill_vreg_params() reads
+ * seq_val as enum msm_camera_vreg_name_t and looks the name up again, so
+ * the two only agree when the DT lists cam_vdig, cam_vio, cam_vana, cam_vaf
+ * in that order. Store the enum so a camera with fewer rails (talkman front:
+ * cam_vio + cam_vana) can list just those.
+ */
+static void msm_sensor_driver_dt_vreg_to_enum(struct camera_vreg_t *cam_vreg,
+	int num_vreg, struct msm_sensor_power_setting *ps, uint16_t size)
+{
+	static const char * const names[CAM_VREG_MAX] = {
+		[CAM_VDIG] = "cam_vdig",
+		[CAM_VIO] = "cam_vio",
+		[CAM_VANA] = "cam_vana",
+		[CAM_VAF] = "cam_vaf",
+		[CAM_V_CUSTOM1] = "cam_v_custom1",
+		[CAM_V_CUSTOM2] = "cam_v_custom2",
+	};
+	uint16_t i, j;
+
+	for (i = 0; i < size; i++) {
+		if (ps[i].seq_type != SENSOR_VREG || ps[i].seq_val >= num_vreg)
+			continue;
+		for (j = 0; j < CAM_VREG_MAX; j++) {
+			if (!strcmp(cam_vreg[ps[i].seq_val].reg_name, names[j])) {
+				ps[i].seq_val = j;
+				break;
+			}
+		}
+	}
+}
+
 static int32_t msm_sensor_driver_use_dt_power(struct msm_sensor_ctrl_t *s_ctrl,
 	struct msm_camera_sensor_slave_info *slave_info)
 {
@@ -621,6 +654,12 @@ static int32_t msm_sensor_driver_use_dt_power(struct msm_sensor_ctrl_t *s_ctrl,
 			__func__, slave_info->sensor_name, rc);
 		return rc;
 	}
+	msm_sensor_driver_dt_vreg_to_enum(power_info->cam_vreg,
+		power_info->num_vreg, power_info->power_setting,
+		power_info->power_setting_size);
+	msm_sensor_driver_dt_vreg_to_enum(power_info->cam_vreg,
+		power_info->num_vreg, power_info->power_down_setting,
+		power_info->power_down_setting_size);
 
 	if (!of_property_read_u32_array(s_ctrl->of_node, "qcom,slave-id",
 			id, ARRAY_SIZE(id))) {
