@@ -13,6 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/clk.h>
+#include <linux/io.h>
 #include <linux/delay.h>
 #include <linux/debugfs.h>
 #include <linux/slab.h>
@@ -624,6 +625,134 @@ static ssize_t power_write(struct file *file, const char __user *ubuf,
 	mutex_unlock(&s->lock);
 	return rc ? rc : count;
 }
+
+/* ---- camreg: CAMSS MMIO peek/poke --------------------------------- */
+
+/*
+ * "r <phys> [count]" reads 32-bit words, "w <phys> <val>" writes one,
+ * "s <phys> [count]" samples one TLMM register (pad toggling).
+ * Limited to the CAMSS block (CSID/CSIPHY/ISPIF/VFE/clock muxes). Only
+ * while a camera is streaming: an unclocked access hangs the bus.
+ */
+#define CAMREG_BASE	0xfda00000
+#define CAMREG_SIZE	0x100000
+static void __iomem *camreg_base;
+
+/*
+ * An access to a CAMSS block whose AHB clock is off hangs the bus (silent
+ * reset). Check the MMSS clock controller CBCRs (bit 31 = CLK_OFF) first.
+ */
+#define TLMM_BASE	0xfd510000
+#define TLMM_SIZE	0x4000
+static void __iomem *tlmm_base;
+
+#define MMSS_CC_BASE	0xfd8c0000
+#define MMSS_CC_SIZE	0x5200
+static void __iomem *mmss_cc_base;
+
+static bool camreg_cbcr_on(u32 off)
+{
+	return !(readl_relaxed(mmss_cc_base + off) & BIT(31));
+}
+
+static bool camreg_clk_ok(u32 addr)
+{
+	static const u32 csid_ahb[] = { 0x30bc, 0x3128, 0x3188, 0x31e8 };
+	static const u32 phy_timer[] = { 0x3024, 0x3054, 0x3084 };
+
+	if (!mmss_cc_base || !camreg_cbcr_on(0x3484) || !camreg_cbcr_on(0x348c))
+		return false;	/* CAMSS_TOP_AHB, CAMSS_AHB */
+	if (addr >= 0xfda08000 && addr < 0xfda09000)
+		return camreg_cbcr_on(csid_ahb[(addr - 0xfda08000) / 0x400]);
+	if (addr >= 0xfda0ac00 && addr < 0xfda0b800)
+		return camreg_cbcr_on(phy_timer[(addr - 0xfda0ac00) / 0x400]);
+	if (addr >= 0xfda0a000 && addr < 0xfda0ac00)
+		return camreg_cbcr_on(0x3224);	/* ISPIF_AHB */
+	if (addr >= 0xfda10000 && addr < 0xfda18000)
+		return camreg_cbcr_on(0x36b8);	/* VFE_AHB */
+	return true;
+}
+
+static ssize_t camreg_write(struct file *file, const char __user *ubuf,
+			    size_t count, loff_t *ppos)
+{
+	struct talkman_cci_scan *s = file->private_data;
+	char cmd[64], op;
+	unsigned int addr, val = 1, i;
+	int n;
+
+	if (!camreg_base || count >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, ubuf, count))
+		return -EFAULT;
+	cmd[count] = '\0';
+	n = sscanf(cmd, "%c %i %i", &op, &addr, &val);
+	if (n < 2 || (op != 'r' && op != 'w' && op != 's') ||
+	    (op == 'w' && n < 3) || (addr & 3))
+		return -EINVAL;
+	if (tlmm_base && addr >= TLMM_BASE && addr - TLMM_BASE < TLMM_SIZE) {
+		void __iomem *p = tlmm_base + (addr - TLMM_BASE);
+		u32 v, and = ~0u, or = 0, ones = 0;
+
+		mutex_lock(&s->lock);
+		if (op == 'w') {
+			writel_relaxed(val, p);
+			mb();
+			scan_append(s, "w 0x%08x <- 0x%08x\n", addr, val);
+		} else if (op == 's') {
+			/* sample one register: does a pad toggle (MCLK)? */
+			if (val < 1 || val > 100000)
+				val = 1000;
+			for (i = 0; i < val; i++) {
+				v = readl_relaxed(p);
+				and &= v;
+				or |= v;
+				ones += v & 1;
+			}
+			scan_append(s, "0x%08x: %u samples and=0x%08x or=0x%08x bit0 ones=%u\n",
+				    addr, val, and, or, ones);
+		} else {
+			if (val > 64)
+				val = 64;
+			for (i = 0; i < val && addr + 4 * i - TLMM_BASE < TLMM_SIZE; i++)
+				scan_append(s, "0x%08x: 0x%08x\n", addr + 4 * i,
+					    readl_relaxed(p + 4 * i));
+		}
+		mutex_unlock(&s->lock);
+		return count;
+	}
+	if (op == 's' || addr < CAMREG_BASE || addr - CAMREG_BASE >= CAMREG_SIZE)
+		return -EINVAL;
+	mutex_lock(&s->lock);
+	if (!camreg_clk_ok(addr)) {
+		scan_append(s, "0x%08x: clock off, refused\n", addr);
+		mutex_unlock(&s->lock);
+		return -EIO;
+	}
+	if (op == 'w') {
+		writel_relaxed(val, camreg_base + (addr - CAMREG_BASE));
+		mb();
+		scan_append(s, "w 0x%08x <- 0x%08x\n", addr, val);
+	} else {
+		if (val > 64)
+			val = 64;
+		/* reads stay inside the block whose clock was checked */
+		for (i = 0; i < val && addr + 4 * i - CAMREG_BASE < CAMREG_SIZE; i++)
+			scan_append(s, "0x%08x: 0x%08x\n", addr + 4 * i,
+				    readl_relaxed(camreg_base +
+						  (addr + 4 * i - CAMREG_BASE)));
+	}
+	mutex_unlock(&s->lock);
+	return count;
+}
+
+static const struct file_operations camreg_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = scan_read,
+	.write = camreg_write,
+	.llseek = default_llseek,
+};
 
 static const struct file_operations power_fops = {
 	.owner = THIS_MODULE,
@@ -1414,6 +1543,11 @@ static int talkman_cci_scan_probe(struct platform_device *pdev)
 		d = debugfs_create_file("i2c", 0660, s->dbg, s, &i2c_fops);
 		talkman_cci_scan_own(d, 0660);
 		d = debugfs_create_file("ois", 0660, s->dbg, s, &ois_fops);
+		talkman_cci_scan_own(d, 0660);
+		camreg_base = ioremap(CAMREG_BASE, CAMREG_SIZE);
+		mmss_cc_base = ioremap(MMSS_CC_BASE, MMSS_CC_SIZE);
+		tlmm_base = ioremap(TLMM_BASE, TLMM_SIZE);
+		d = debugfs_create_file("camreg", 0660, s->dbg, s, &camreg_fops);
 		talkman_cci_scan_own(d, 0660);
 	}
 
