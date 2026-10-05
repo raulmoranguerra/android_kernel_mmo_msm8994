@@ -215,17 +215,18 @@ static int msm_csiphy_lane_config(struct csiphy_device *csiphy_dev,
 			} else if (j == CLK_LANE_OFFSET) {
 				lane_val = 0x4;
 			}
-			if (csiphy_params->combo_mode == 1) {
+			if (csiphy_params->combo_mode == 1 &&
+				(csiphy_params->lane_mask & 0x18) == 0x18) {
 				/*
-				* In the case of combo mode, the clock is always
-				* 4th lane for the second sensor.
-				* So check whether the sensor is of one lane
-				* sensor and curr_lane for 0.
-				*/
-				if (curr_lane == 0 &&
-					((csiphy_params->lane_mask &
-						0x18) == 0x18))
-					lane_val = 0x4;
+				 * Combo (2+1) mode, second sensor: lane 3 is
+				 * its clock and lane 4 its data lane. MISC1
+				 * bit 1 assigns a lane to the second port;
+				 * CAF leaves it clear (0x4/0x8) and the second
+				 * port then receives nothing. The Windows
+				 * 8992 CSI HAL (talkman iris camera) uses
+				 * 0x06/0x0a.
+				 */
+				lane_val = (j == 3) ? 0x6 : 0xa;
 			}
 			msm_camera_io_w(lane_val, csiphybase +
 				csiphy_dev->ctrl_reg->csiphy_reg.
