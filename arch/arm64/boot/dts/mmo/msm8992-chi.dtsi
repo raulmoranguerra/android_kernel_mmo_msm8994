@@ -29,7 +29,9 @@
 #include "common/reserved-memory.dtsi"
 #include "common/nfc.dtsi"
 #include "common/gpios.dtsi"
-#include "common/torch.dtsi"
+/* Rear flash/torch: the Hill driver node in common/talkman-camera.dtsi
+ * (talkman_hill_flash.c) owns led:flash_torch and GPIO 12 (TORCH_EN), so
+ * the gpio-leds torch in common/torch.dtsi is not included. */
 #include "common/sensors.dtsi"
 
 / {
