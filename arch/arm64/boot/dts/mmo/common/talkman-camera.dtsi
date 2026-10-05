@@ -68,23 +68,6 @@
 	};
 };
 
-&soc {
-	/*
-	 * Rear flash: the two PMI8994 flash/torch channels (on-device test:
-	 * led:torch_0 and led:torch_1 light the rear LEDs). Same wiring as
-	 * the msm8992 MTP reference, which talkman-camera.dtsi replaced.
-	 */
-	led_flash0: qcom,camera-flash {
-		cell-index = <0>;
-		compatible = "qcom,camera-flash";
-		qcom,flash-type = <1>;
-		qcom,flash-source = <&pmi8994_flash0 &pmi8994_flash1>;
-		qcom,torch-source = <&pmi8994_torch0 &pmi8994_torch1>;
-		/* clark libflash_sky81296.so requests an I2C flash chip */
-		mmo,flash-type-from-dt;
-	};
-};
-
 &cci {
 	/*
 	 * RM-1104 schematic: CCI0 DATA/CLK = GPIO 17/18, CCI1 DATA/CLK =
@@ -173,7 +156,13 @@
 		 * WOA PEP 9.6 MHz is enough for CCI; CSI PLL wants 24. */
 		qcom,cam-power-seq-cfg-val = <1 1 1 1 24000000>;
 		qcom,cam-power-seq-delay = <1 1 1 1 5>;
-		qcom,led-flash-src = <&led_flash0>;
+		/*
+		 * No qcom,led-flash-src: the PMI8994 flash/torch channels drive
+		 * the front IR LED (camera@2), not the rear flash; bound here, the
+		 * rear pre-flash strobed the IR LED (PMI 0x3D346/7 = 0x80/0xC0,
+		 * 2026-10-05). The rear LEDs are GPIO 12 TORCH_EN (torch.dtsi),
+		 * which the HAL drives when mm-camera reports no flash.
+		 */
 		qcom,actuator-src = <&actuator0>;
 		qcom,sensor-position = <0>;
 		qcom,sensor-mode = <0>;
@@ -250,6 +239,13 @@
 	qcom,camera@2 {
 		cell-index = <2>;
 		compatible = "qcom,camera";
+		/*
+		 * IR LED: the PMI8994 flash module's torch outputs light only the
+		 * front IR LED (on-device 2026-10-05; the rear flash is GPIO 12
+		 * TORCH_EN). Lit while a session holds the sensor powered.
+		 */
+		mmo,ir-leds = "led:torch_0", "led:torch_1";
+		mmo,ir-led-current = <75>;
 		reg = <0x2>;
 		qcom,csiphy-sd-index = <2>;
 		qcom,csid-sd-index = <3>;
