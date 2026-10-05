@@ -18,6 +18,7 @@
 #include <linux/regulator/rpm-smd-regulator.h>
 #include <linux/regulator/consumer.h>
 #include <linux/delay.h>
+#include <linux/leds.h>
 
 #undef CDBG
 #define CDBG(fmt, args...) pr_debug(fmt, ##args)
@@ -578,6 +579,48 @@ static struct msm_cam_clk_info cam_8974_clk_info[] = {
 	[SENSOR_CAM_CLK] = {"cam_clk", 0},
 };
 
+/*
+ * Talkman: LED class devices to light while a camera session holds the
+ * sensor powered. The iris camera's IR LED is the PMI8994 flash module
+ * (led:torch_0/1): "mmo,ir-leds" names the LEDs, "mmo,ir-led-current" is
+ * the brightness (mA for the qpnp torch outputs), clamped to each LED's max.
+ */
+extern struct rw_semaphore leds_list_lock;
+extern struct list_head leds_list;
+
+static void msm_sensor_ir_leds(struct msm_sensor_ctrl_t *s_ctrl, bool on)
+{
+	struct led_classdev *led;
+	const char *name;
+	u32 cur = 0;
+	int i, n;
+
+	if (!s_ctrl->of_node)
+		return;
+	n = of_property_count_strings(s_ctrl->of_node, "mmo,ir-leds");
+	if (n <= 0)
+		return;
+	if (on && of_property_read_u32(s_ctrl->of_node, "mmo,ir-led-current",
+				       &cur))
+		return;
+	down_read(&leds_list_lock);
+	for (i = 0; i < n; i++) {
+		if (of_property_read_string_index(s_ctrl->of_node,
+						  "mmo,ir-leds", i, &name))
+			continue;
+		list_for_each_entry(led, &leds_list, node) {
+			if (strcmp(led->name, name))
+				continue;
+			led_set_brightness(led, on ?
+				min_t(u32, cur, led->max_brightness) : LED_OFF);
+			break;
+		}
+	}
+	up_read(&leds_list_lock);
+	pr_info("%s: %s IR LEDs %s (%u)\n", __func__,
+		s_ctrl->sensordata->sensor_name, on ? "on" : "off", cur);
+}
+
 int msm_sensor_power_down(struct msm_sensor_ctrl_t *s_ctrl)
 {
 	struct msm_camera_power_ctrl_t *power_info;
@@ -734,6 +777,7 @@ static void msm_sensor_stop_stream(struct msm_sensor_ctrl_t *s_ctrl)
 			if (s_ctrl->sensordata->misc_regulator)
 				msm_sensor_misc_regulator(s_ctrl, 0);
 
+			msm_sensor_ir_leds(s_ctrl, false);
 			rc = s_ctrl->func_tbl->sensor_power_down(s_ctrl);
 			if (rc < 0) {
 				pr_err("%s:%d failed rc %d\n", __func__,
@@ -1101,6 +1145,7 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 				break;
 			}
 			s_ctrl->sensor_state = MSM_SENSOR_POWER_UP;
+			msm_sensor_ir_leds(s_ctrl, true);
 			CDBG("%s:%d sensor state %d\n", __func__, __LINE__,
 				s_ctrl->sensor_state);
 			msm_cam_dump_mclk0_pad("cfg_power_up", 1);
@@ -1121,6 +1166,7 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 			if (s_ctrl->sensordata->misc_regulator)
 				msm_sensor_misc_regulator(s_ctrl, 0);
 
+			msm_sensor_ir_leds(s_ctrl, false);
 			rc = s_ctrl->func_tbl->sensor_power_down(s_ctrl);
 			if (rc < 0) {
 				pr_err("%s:%d failed rc %d\n", __func__,
@@ -1526,6 +1572,7 @@ int msm_sensor_config(struct msm_sensor_ctrl_t *s_ctrl, void __user *argp)
 				break;
 			}
 			s_ctrl->sensor_state = MSM_SENSOR_POWER_UP;
+			msm_sensor_ir_leds(s_ctrl, true);
 			CDBG("%s:%d sensor state %d\n", __func__, __LINE__,
 				s_ctrl->sensor_state);
 			msm_cam_dump_mclk0_pad("cfg_power_up", 1);
@@ -1547,6 +1594,7 @@ int msm_sensor_config(struct msm_sensor_ctrl_t *s_ctrl, void __user *argp)
 			if (s_ctrl->sensordata->misc_regulator)
 				msm_sensor_misc_regulator(s_ctrl, 0);
 
+			msm_sensor_ir_leds(s_ctrl, false);
 			rc = s_ctrl->func_tbl->sensor_power_down(s_ctrl);
 			if (rc < 0) {
 				pr_err("%s:%d failed rc %d\n", __func__,
