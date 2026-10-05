@@ -338,3 +338,19 @@
 		qcom,clock-rates = <0 0 266670000 0 0 0 0 0 0>;
 	};
 };
+
+/ {
+	/*
+	 * Rear flash: "Hill", three-LED flash driver on CCI0 0x30 (ID 0x16),
+	 * driven by talkman_hill_flash.c: led:flash_torch (torch) and
+	 * led:flash_rear (photo strobe, mA per LED). GPIO 12 is its TORCH_EN
+	 * pin, held low. Register use from the Windows driver, see
+	 * research/front-iris-cameras.md in lumia950-android.
+	 */
+	talkman-rear-flash {
+		compatible = "mmo,talkman-hill-flash";
+		mmo,torch-en-gpio = <&msm_gpio 12 0>;
+		mmo,flash-ma = <300>;
+		mmo,flash-max-ms = <1500>;
+	};
+};
