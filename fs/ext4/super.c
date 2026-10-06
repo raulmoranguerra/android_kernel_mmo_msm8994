@@ -4117,8 +4117,25 @@ no_journal:
 
 	/* determine the minimum size of new large inodes, if present */
 	if (sbi->s_inode_size > EXT4_GOOD_OLD_INODE_SIZE) {
-		sbi->s_want_extra_isize = sizeof(struct ext4_inode) -
+		/*
+		 * i_projid (project quota backport) grew struct ext4_inode
+		 * to 160 bytes. Only want room for it when the filesystem
+		 * has project quotas; otherwise keep the pre-backport 28,
+		 * which is what existing filesystems were created with.
+		 * Wanting 32 makes ext4_mark_inode_dirty() expand every
+		 * older inode, and when that moves xattrs out to a new block
+		 * from ext4_truncate() (i_data_sem held for write),
+		 * ext4_xattr_block_set() takes i_data_sem again and the task
+		 * deadlocks holding a journal handle, freezing the fs.
+		 */
+		if (EXT4_HAS_RO_COMPAT_FEATURE(sb,
+				       EXT4_FEATURE_RO_COMPAT_PROJECT))
+			sbi->s_want_extra_isize = sizeof(struct ext4_inode) -
 						     EXT4_GOOD_OLD_INODE_SIZE;
+		else
+			sbi->s_want_extra_isize =
+				offsetof(struct ext4_inode, i_projid) -
+				EXT4_GOOD_OLD_INODE_SIZE;
 		if (EXT4_HAS_RO_COMPAT_FEATURE(sb,
 				       EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE)) {
 			if (sbi->s_want_extra_isize <
