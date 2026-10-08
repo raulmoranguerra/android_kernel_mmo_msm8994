@@ -366,12 +366,15 @@ static inline struct mtp_dev *func_to_mtp(struct usb_function *f)
 static struct usb_request *mtp_request_new(struct usb_ep *ep, int buffer_size)
 {
 	struct usb_request *req = usb_ep_alloc_request(ep, GFP_KERNEL);
+	unsigned int flags = GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN;
+
 	if (!req)
 		return NULL;
 
 	/* now allocate buffers for the requests */
-	req->buf = kmalloc(buffer_size, GFP_KERNEL);
+	req->buf = kmalloc(buffer_size, flags);
 	if (!req->buf) {
+		pr_info("%s: memory allocation failed!\n", __func__);
 		usb_ep_free_request(ep, req);
 		return NULL;
 	}
@@ -476,7 +479,7 @@ static int mtp_create_bulk_endpoints(struct mtp_dev *dev,
 	struct usb_ep *ep;
 	int i;
 
-	DBG(cdev, "create_bulk_endpoints dev: %pK\n", dev);
+	DBG(cdev, "create_bulk_endpoints dev: %p\n", dev);
 
 	ep = usb_ep_autoconfig(cdev->gadget, in_desc);
 	if (!ep) {
@@ -513,10 +516,10 @@ retry_tx_alloc:
 	for (i = 0; i < mtp_tx_reqs; i++) {
 		req = mtp_request_new(dev->ep_in, mtp_tx_req_len);
 		if (!req) {
-			if (mtp_tx_req_len <= MTP_BULK_BUFFER_SIZE)
-				goto fail;
 			while ((req = mtp_req_get(dev, &dev->tx_idle)))
 				mtp_request_free(req, dev->ep_in);
+			if (mtp_tx_req_len <= MTP_BULK_BUFFER_SIZE)
+				goto tx_fail;
 			mtp_tx_req_len = MTP_BULK_BUFFER_SIZE;
 			mtp_tx_reqs = MTP_TX_REQ_MAX;
 			goto retry_tx_alloc;
@@ -538,10 +541,10 @@ retry_rx_alloc:
 	for (i = 0; i < RX_REQ_MAX; i++) {
 		req = mtp_request_new(dev->ep_out, mtp_rx_req_len);
 		if (!req) {
-			if (mtp_rx_req_len <= MTP_BULK_BUFFER_SIZE)
-				goto fail;
 			for (--i; i >= 0; i--)
 				mtp_request_free(dev->rx_req[i], dev->ep_out);
+			if (mtp_rx_req_len <= MTP_BULK_BUFFER_SIZE)
+				goto rx_fail;
 			mtp_rx_req_len = MTP_BULK_BUFFER_SIZE;
 			goto retry_rx_alloc;
 		}
@@ -550,15 +553,24 @@ retry_rx_alloc:
 	}
 	for (i = 0; i < INTR_REQ_MAX; i++) {
 		req = mtp_request_new(dev->ep_intr, INTR_BUFFER_SIZE);
-		if (!req)
-			goto fail;
+		if (!req) {
+			while ((req = mtp_req_get(dev, &dev->intr_idle)))
+				mtp_request_free(req, dev->ep_intr);
+			goto intr_fail;
+		}
 		req->complete = mtp_complete_intr;
 		mtp_req_put(dev, &dev->intr_idle, req);
 	}
 
 	return 0;
 
-fail:
+intr_fail:
+	for (i = 0; i < RX_REQ_MAX; i++)
+		mtp_request_free(dev->rx_req[i], dev->ep_out);
+rx_fail:
+	while ((req = mtp_req_get(dev, &dev->tx_idle)))
+		mtp_request_free(req, dev->ep_in);
+tx_fail:
 	printk(KERN_ERR "mtp_bind() could not allocate requests\n");
 	return -1;
 }
@@ -609,7 +621,7 @@ requeue_req:
 		r = -EIO;
 		goto done;
 	} else {
-		DBG(cdev, "rx %pK queue\n", req);
+		DBG(cdev, "rx %p queue\n", req);
 	}
 
 	/* wait for a request to complete */
@@ -634,7 +646,7 @@ requeue_req:
 		if (req->actual == 0)
 			goto requeue_req;
 
-		DBG(cdev, "rx %pK %d\n", req, req->actual);
+		DBG(cdev, "rx %p %d\n", req, req->actual);
 		xfer = (req->actual < count) ? req->actual : count;
 		r = xfer;
 		if (copy_to_user(buf, req->buf, xfer))
@@ -767,6 +779,11 @@ static void send_file_work(struct work_struct *data)
 	offset = dev->xfer_file_offset;
 	count = dev->xfer_file_length;
 
+	if (count < 0) {
+		dev->xfer_result = -EINVAL;
+		return;
+	}
+
 	DBG(cdev, "send_file_work(%lld %lld)\n", offset, count);
 
 	if (dev->xfer_send_header) {
@@ -869,6 +886,11 @@ static void receive_file_work(struct work_struct *data)
 	offset = dev->xfer_file_offset;
 	count = dev->xfer_file_length;
 
+	if (count < 0) {
+		dev->xfer_result = -EINVAL;
+		return;
+	}
+
 	DBG(cdev, "receive_file_work(%lld)\n", count);
 	if (!IS_ALIGNED(count, dev->ep_out->maxpacket))
 		DBG(cdev, "%s- count(%lld) not multiple of mtu(%d)\n", __func__,
@@ -894,7 +916,7 @@ static void receive_file_work(struct work_struct *data)
 		}
 
 		if (write_req) {
-			DBG(cdev, "rx %pK %d\n", write_req, write_req->actual);
+			DBG(cdev, "rx %p %d\n", write_req, write_req->actual);
 			ret = vfs_write(filp, write_req->buf, write_req->actual,
 				&offset);
 			DBG(cdev, "vfs_write %d\n", ret);
@@ -1306,7 +1328,7 @@ mtp_function_bind(struct usb_configuration *c, struct usb_function *f)
 	int			ret;
 
 	dev->cdev = cdev;
-	DBG(cdev, "mtp_function_bind dev: %pK\n", dev);
+	DBG(cdev, "mtp_function_bind dev: %p\n", dev);
 
 	/* allocate interface ID(s) */
 	id = usb_interface_id(c, f);

@@ -520,3 +520,5 @@ static void __exit ci13xxx_msm_exit(void)
 module_exit(ci13xxx_msm_exit);
 
 MODULE_LICENSE("GPL v2");
+
+DEFINE_TRACE(usb_daytona_invalid_access);

@@ -326,7 +326,7 @@ int dwc3_event_buffers_setup(struct dwc3 *dwc)
 
 	for (n = 0; n < dwc->num_event_buffers; n++) {
 		evt = dwc->ev_buffs[n];
-		dev_dbg(dwc->dev, "Event buf %pK dma %08llx length %d\n",
+		dev_dbg(dwc->dev, "Event buf %p dma %08llx length %d\n",
 				evt->buf, (unsigned long long) evt->dma,
 				evt->length);
 
@@ -616,6 +616,8 @@ static int dwc3_probe(struct platform_device *pdev)
 
 	dwc->needs_fifo_resize = of_property_read_bool(node, "tx-fifo-resize");
 	host_only_mode = of_property_read_bool(node, "snps,host-only-mode");
+	dwc->no_set_vbus_power = of_property_read_bool(node,
+						"no-set-vbus-power");
 	dwc->ssphy_clear_auto_suspend_on_disconnect =
 						of_property_read_bool(node,
 						"snps,ssphy-clear-auto-suspend-on-disconnect");
@@ -853,7 +855,6 @@ static int dwc3_remove(struct platform_device *pdev)
 
 	dwc3_core_exit(dwc);
 
-	pm_runtime_put_sync(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 
 	return 0;
