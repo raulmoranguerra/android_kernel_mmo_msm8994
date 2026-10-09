@@ -62,6 +62,40 @@ static DEFINE_SPINLOCK(tz_lock);
 
 #define TAG "msm_adreno_tz: "
 
+/*
+ * Lumia 950/950 XL: the TZ accepts the DCVS init, but its update never moves
+ * the GPU off its two lowest levels (devfreq trans_stat after hours of use:
+ * only 180 and 300 MHz, max 600 MHz), so frames that take 7 ms at 600 MHz
+ * take 17+ ms and every app janks. With kernel_dcvs the level is chosen here
+ * from the busy percentage over at least kdcvs_window_us of GPU time: above
+ * kdcvs_up_pct one level up (two above kdcvs_jump_pct), below kdcvs_down_pct
+ * one level down. kernel_dcvs=0 goes back to the TZ.
+ */
+static bool kernel_dcvs = true;
+module_param(kernel_dcvs, bool, 0644);
+static unsigned int kdcvs_window_us = 10000;
+module_param(kdcvs_window_us, uint, 0644);
+static unsigned int kdcvs_up_pct = 30;
+module_param(kdcvs_up_pct, uint, 0644);
+static unsigned int kdcvs_jump_pct = 50;
+module_param(kdcvs_jump_pct, uint, 0644);
+static unsigned int kdcvs_down_pct = 10;
+module_param(kdcvs_down_pct, uint, 0644);
+
+/* Level change for the busy share of a window; level 0 is the fastest. */
+static int kernel_dcvs_delta(s64 total_time, s64 busy_time)
+{
+	unsigned int pct = (unsigned int)div64_s64(busy_time * 100, total_time);
+
+	if (pct > kdcvs_jump_pct)
+		return -2;
+	if (pct > kdcvs_up_pct)
+		return -1;
+	if (pct < kdcvs_down_pct)
+		return 1;
+	return 0;
+}
+
 struct msm_adreno_extended_profile *partner_gpu_profile;
 static void do_partner_start_event(struct work_struct *work);
 static void do_partner_stop_event(struct work_struct *work);
@@ -203,7 +237,15 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 	 * has passed since the last run or the gpu hasn't been
 	 * busier than MIN_BUSY.
 	 */
-	if ((stats.total_time == 0) ||
+	if (kernel_dcvs) {
+		/*
+		 * No MIN_BUSY skip here: an almost idle window must still be
+		 * able to step the clock down.
+		 */
+		if (stats.total_time == 0 ||
+		    priv->bin.total_time < kdcvs_window_us)
+			return 0;
+	} else if ((stats.total_time == 0) ||
 		(priv->bin.total_time < FLOOR) ||
 		(unsigned int) priv->bin.busy_time < MIN_BUSY) {
 		return 0;
@@ -233,6 +275,9 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 		val = -1 * level;
 		busy_bin = 0;
 		frame_flag = 0;
+	} else if (kernel_dcvs) {
+		val = kernel_dcvs_delta(priv->bin.total_time,
+					priv->bin.busy_time);
 	} else {
 
 		scm_data[0] = level;
